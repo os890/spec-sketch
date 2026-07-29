@@ -1,0 +1,182 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+    Licensed under the Apache License, Version 2.0 (the "License");
+    you may not use this file except in compliance with the License.
+    You may obtain a copy of the License at
+
+        http://www.apache.org/licenses/LICENSE-2.0
+
+    Unless required by applicable law or agreed to in writing, software
+    distributed under the License is distributed on an "AS IS" BASIS,
+    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+    See the License for the specific language governing permissions and
+    limitations under the License.
+-->
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <groupId>org.os890.sketch</groupId>
+  <artifactId>openapi-jakarta10-dto-demo</artifactId>
+  <version>1.0.0-SNAPSHOT</version>
+  <packaging>pom</packaging>
+
+  <name>openapi-jakarta10-dto-demo</name>
+  <description>Demo: generate JAX-RS 3.1 (Jakarta EE 10) DTO classes from an OpenAPI spec via openapi-generator-maven-plugin</description>
+
+  <licenses>
+    <license>
+      <name>Apache License, Version 2.0</name>
+      <url>https://www.apache.org/licenses/LICENSE-2.0.txt</url>
+      <distribution>repo</distribution>
+    </license>
+  </licenses>
+
+  <modules>
+    <!-- spec written by hand as OpenAPI YAML -->
+    <module>yaml-first</module>
+    <!-- spec written in TypeSpec, compiled to OpenAPI YAML during the build -->
+    <module>typespec-first</module>
+    <!-- spec written in a custom SpecSketch DSL, translated to OpenAPI YAML by a single Java file -->
+    <module>sketch-first</module>
+  </modules>
+
+  <properties>
+    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+    <!-- Jakarta EE 10 baseline is Java SE 11/17 - we target 17 -->
+    <maven.compiler.release>17</maven.compiler.release>
+
+    <openapi-generator.version>7.14.0</openapi-generator.version>
+    <exec-maven-plugin.version>3.3.0</exec-maven-plugin.version>
+    <jakarta.ws.rs-api.version>3.1.0</jakarta.ws.rs-api.version>
+    <jakarta.validation-api.version>3.0.2</jakarta.validation-api.version>
+    <jakarta.annotation-api.version>2.1.1</jakarta.annotation-api.version>
+    <jackson.version>2.17.2</jackson.version>
+    <junit.version>5.10.3</junit.version>
+  </properties>
+
+  <!-- both modules use the identical dependency set -->
+  <dependencies>
+    <!-- JAX-RS 3.1 (Jakarta EE 10) -->
+    <dependency>
+      <groupId>jakarta.ws.rs</groupId>
+      <artifactId>jakarta.ws.rs-api</artifactId>
+      <version>${jakarta.ws.rs-api.version}</version>
+      <scope>provided</scope>
+    </dependency>
+    <!-- Bean Validation 3.0 (Jakarta EE 10) - generated DTOs carry jakarta.validation annotations -->
+    <dependency>
+      <groupId>jakarta.validation</groupId>
+      <artifactId>jakarta.validation-api</artifactId>
+      <version>${jakarta.validation-api.version}</version>
+      <scope>provided</scope>
+    </dependency>
+    <dependency>
+      <groupId>jakarta.annotation</groupId>
+      <artifactId>jakarta.annotation-api</artifactId>
+      <version>${jakarta.annotation-api.version}</version>
+      <scope>provided</scope>
+    </dependency>
+    <!-- Jackson annotations used by the generated DTOs (databind only needed for the demo test) -->
+    <dependency>
+      <groupId>com.fasterxml.jackson.core</groupId>
+      <artifactId>jackson-databind</artifactId>
+      <version>${jackson.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>com.fasterxml.jackson.datatype</groupId>
+      <artifactId>jackson-datatype-jsr310</artifactId>
+      <version>${jackson.version}</version>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.junit.jupiter</groupId>
+      <artifactId>junit-jupiter</artifactId>
+      <version>${junit.version}</version>
+      <scope>test</scope>
+    </dependency>
+  </dependencies>
+
+  <build>
+    <plugins>
+      <!-- guards the Apache license headers: a source file without one fails the build -->
+      <plugin>
+        <groupId>org.apache.rat</groupId>
+        <artifactId>apache-rat-plugin</artifactId>
+        <version>0.16.1</version>
+        <executions>
+          <execution>
+            <id>rat-check</id>
+            <phase>validate</phase>
+            <goals>
+              <goal>check</goal>
+            </goals>
+          </execution>
+        </executions>
+        <configuration>
+          <excludes>
+            <!-- build output and fetched tooling -->
+            <exclude>**/target/**</exclude>
+            <exclude>**/node_modules/**</exclude>
+            <exclude>**/tsp-output/**</exclude>
+            <!-- files that cannot or should not carry a header -->
+            <exclude>**/*.md</exclude>
+            <exclude>**/.gitignore</exclude>
+            <exclude>**/package.json</exclude>
+            <exclude>**/pnpm-lock.yaml</exclude>
+          </excludes>
+        </configuration>
+      </plugin>
+    </plugins>
+    <pluginManagement>
+      <plugins>
+        <plugin>
+          <groupId>org.openapitools</groupId>
+          <artifactId>openapi-generator-maven-plugin</artifactId>
+          <version>${openapi-generator.version}</version>
+          <executions>
+            <execution>
+              <id>generate-dtos</id>
+              <goals>
+                <goal>generate</goal>
+              </goals>
+              <!-- shared generator config; each module only contributes its <inputSpec> -->
+              <configuration>
+                <!-- 'jaxrs-spec' targets plain JAX-RS; with useJakartaEe=true it emits jakarta.* imports -->
+                <generatorName>jaxrs-spec</generatorName>
+                <modelPackage>org.os890.sketch.petstore.dto</modelPackage>
+                <!-- DTOs only: skip API interfaces, docs and supporting files -->
+                <generateApis>false</generateApis>
+                <generateModels>true</generateModels>
+                <generateApiDocumentation>false</generateApiDocumentation>
+                <generateModelDocumentation>false</generateModelDocumentation>
+                <generateSupportingFiles>false</generateSupportingFiles>
+                <configOptions>
+                  <!-- THE switch for Jakarta EE 10: jakarta.validation / jakarta.ws.rs instead of javax.* -->
+                  <useJakartaEe>true</useJakartaEe>
+                  <dateLibrary>java8</dateLibrary>
+                  <!-- keep DTOs dependency-light: no swagger/microprofile annotations -->
+                  <useSwaggerAnnotations>false</useSwaggerAnnotations>
+                  <!-- don't generate a pom for the generated module -->
+                  <generatePom>false</generatePom>
+                  <sourceFolder>src/gen/java</sourceFolder>
+                </configOptions>
+              </configuration>
+            </execution>
+          </executions>
+        </plugin>
+        <plugin>
+          <groupId>org.codehaus.mojo</groupId>
+          <artifactId>exec-maven-plugin</artifactId>
+          <version>${exec-maven-plugin.version}</version>
+        </plugin>
+        <plugin>
+          <groupId>org.apache.maven.plugins</groupId>
+          <artifactId>maven-surefire-plugin</artifactId>
+          <version>3.2.5</version>
+        </plugin>
+      </plugins>
+    </pluginManagement>
+  </build>
+</project>

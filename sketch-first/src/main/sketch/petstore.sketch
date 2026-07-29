@@ -1,0 +1,75 @@
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# SpecSketch: request + response definition for the petstore demo
+#
+# format:      <name> (<occurrence>) : <type>
+# occurrence:  a number (1) or a range (0 - 1, 1 - *, 2 - 5)
+# nesting:     4 spaces or 1 tab per level; a line with fewer spaces
+#              implicitly ends all deeper structures
+# types:       with nested properties -> object schema
+#              without properties     -> built-in type or reference to a type
+#                                        defined elsewhere in this file
+# enums:       shorthand via 'enum' + values, e.g.: gender (1) : enum [M, F]
+#              optional value type: enum:String [M, F] or enum:int [1, 2, 3]
+#              reusable named enums: first occurrence defines them, e.g.
+#              status (1) : enum PetStatus [...], later just: status (1) : PetStatus
+# comments:    trailing comments via //, /* ... */ or # on any line;
+#              comment-only lines are ignored at any indentation
+# headers:     direct children of request/response starting with '@' are
+#              HTTP headers instead of body properties
+# inheritance: 'extended by <SubType>' inside a type definition starts a subtype
+#              block (additional properties); a property with the reserved
+#              type 'discriminator' makes the hierarchy polymorphic
+# parts:       top-level 'response' is mandatory; top-level 'request' is
+#              optional (with request -> POST with body, without -> GET)
+
+# attributes:  optional {key: value, ...} validation block after the type,
+#              e.g. {minLength: 1, maxLength: 100} or {min: 0, max: 150}
+# imports:     'import <Type>' declares an externally defined type (usages
+#              become $refs; without 'from "..."' a TODO placeholder is used)
+
+import Money from "../../src/main/sketch/common-types.yaml"
+
+request (1) : CreatePetRequest              // with a request body the operation becomes a POST
+    @X-Request-Id (0 - 1) : uuid            // custom request header
+    name (1) : string {minLength: 1, maxLength: 100}
+    status (0 - 1) : enum PetStatus [AVAILABLE, PENDING, SOLD] // defines the reusable named enum
+    category (0 - 1) : Category             /* defined in the response part below */
+    tags (0 - *) : string
+
+response (1) : PetPageResponse
+    pets (0 - *) : Pet
+        id (1) : long
+        name (1) : string
+        status (1) : PetStatus              // reuses the named enum defined in the request part
+        category (0 - 1) : Category
+            id (1) : long
+            name (1) : string
+        tags (0 - *) : string
+        createdAt (0 - 1) : Instant
+        birthday (0 - 1) : LocalDate
+        price (0 - 1) : Money               // imported type from common-types.yaml
+    totalCount (1) : int
+    owner (0 - 1) : Owner
+        name (1) : string
+        contact (1) : Contact
+            email (1) : string
+            phone (0 - 1) : string
+    favorite (0 - 1) : Pet
+    events (0 - *) : PetEvent               // base type, used by the property...
+        eventType (1) : discriminator      // ...made polymorphic via the discriminator
+        occurredAt (1) : Instant
+        extended by VaccinationEvent            // subtype: base properties + these
+            vaccine (1) : string
+        extended by AdoptionEvent
+            newOwner (1) : string

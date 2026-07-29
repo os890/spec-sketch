@@ -1,0 +1,85 @@
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# ============================================================================
+# SpecSketch showcase - every feature of the DSL in a single definition.
+# Not wired into the build; try it with:
+#   java src/main/tools/SpecSketchGenerator.java src/main/sketch/showcase.sketch
+# which saves showcase.yaml next to this file (append '-' to print to stdout).
+# ============================================================================
+
+import Money                                        // externally defined type -> usages become
+                                                    // $ref: 'TODO-IMPORT/Money.yaml#/components/schemas/Money'
+                                                    // (post-edit the file part; or use: import Money from "path.yaml")
+
+request (1) : PlaceOrderRequest                     // request body present -> POST with required body
+    @X-Client-Id (1) : uuid                         // '@' = HTTP header (in: header parameter), not body
+    @X-Feature-Flags (0 - *) : string               // repeatable custom header
+    @Accept-Language (0 - 1) : string               // standard headers work the same way
+    customerId (1) : uuid
+    shippingAddress (1) : Address                   // forward reference - defined in the response part
+    items (1 - *) : OrderItem                       /* at least one item */
+        petId (1) : long
+        quantity (1) /* pieces */ : int {min: 1, max: 99}   // validation attributes
+        weightKg (0 - 1) : float
+        notes (0 - 1) : string {maxLength: 500}
+    voucherCode (0 - 1) : string {pattern: "^[A-Z]{2}-[0-9]{4}$"}  // quoted: commas/braces allowed
+    payment (1) : Payment
+        method (1) : enum [CARD, PAYPAL, INVOICE]   // inline anonymous enum (string by default)
+        cardNumber (0 - 1) : String                 # built-ins are case-insensitive: string == String
+    couponCodes (0 - 3) : string                    // bounded range -> array with maxItems 3
+    deliveryWindow (2) : datetime                   // exact number -> array with min = max = 2
+
+response (1) : OrderConfirmation
+    @X-Rate-Limit-Remaining (1) : int               // response header (responses.200.headers)
+    @X-Order-Status (0 - 1) : OrderStatus           // named enums work as header types too
+    orderId (1) : uuid
+    status (1) : enum OrderStatus [PLACED, PAID, SHIPPED, DELIVERED]  // named enum, defined once here
+    rating (0 - 1) : enum:int Stars [1, 2, 3, 4, 5] /* named enum with a numeric value type */
+    placedAt (1) : Instant                          // java.time built-ins (-> OffsetDateTime)
+    deliveryDate (0 - 1) : LocalDate                //                    (-> LocalDate)
+    deliveryAddress (0 - 1) : Address               // first occurrence with properties defines Address
+        street (1) : string
+        zip (1) : string
+        city (1) : string
+        country (0 - 1) : enum:String [AT, DE, CH]  // explicit value type, identical to the default
+    invoice (0 - 1) : Invoice
+        number (1) : string
+        total (1) : Money                           // imported type, see the 'import' line on top
+        gross (1) : BigDecimal
+        vatRate (1) : double
+        paid (1) : boolean
+        currency (1) : char                         // -> string with minLength/maxLength 1
+        positions (1 - *) : InvoicePosition
+            description (1) : string
+            amount (1) : BigDecimal
+            discount (0 - 1) : Discount             // nesting depth is unlimited...
+                percent (1) : double
+                reason (0 - 1) : string
+   // comment-only lines are ignored at ANY indentation and never affect nesting
+    history (0 - *) : StatusChange                  // ...and this dedent drops 3 levels at once
+        from (0 - 1) : OrderStatus                  // reuses the named enum
+        to (1) : OrderStatus
+        changedAt (1) : datetime
+    relatedCategories (0 - *) : Category
+        id (1) : long
+        name (1) : string
+        children (0 - *) : Category                 // recursive type via self-reference
+    shipments (0 - *) : Shipment                    // base type with polymorphic subtypes:
+        shipmentType (1) : discriminator            // reserved type -> discriminator + mapping
+        trackingId (1) : uuid
+        extended by ParcelShipment                      // subtype block: additional properties only
+            weightKg (1) : double
+            extended by ExpressParcel                   // hierarchies can be nested
+                guaranteedBy (1) : Instant
+        extended by PickupShipment
+            storeId (1) : long

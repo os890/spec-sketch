@@ -1,0 +1,11 @@
+{
+  "name": "typespec-first-spec",
+  "version": "1.0.0",
+  "private": true,
+  "description": "TypeSpec sources compiled to OpenAPI YAML (consumed by the Maven build)",
+  "devDependencies": {
+    "@typespec/compiler": "^1.2.0",
+    "@typespec/http": "^1.2.0",
+    "@typespec/openapi3": "^1.2.0"
+  }
+}
