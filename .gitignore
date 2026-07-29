@@ -1,0 +1,50 @@
+# Error files directory
+errors/
+
+# Team identity (local only)
+team.md
+
+# Build output
+target/
+
+# Toolchains ./build.sh and build.cmd fetch: the JDK, Maven, Node and the pnpm shims.
+# Downloaded, never committed; deleting the folder undoes the bootstrap.
+.build-tools/
+
+# Runtime data (H2 database) and the backups written beside it.
+# Anchored to the project root: "backup/" alone would also match the Java package
+# src/main/java/org/os890/smallcrm/backup.
+/data/
+/backup/
+/e2e/backup/
+
+# Log files written by the production profile, beside the application.
+/logs/
+/e2e/logs/
+
+# Ad-hoc archives of the rendered diagrams; the PNGs themselves are committed.
+docs/diagrams.zip
+
+# Coverage artifacts
+coverage/
+
+# Node.js
+node_modules/
+
+# Task planning (local only)
+next_task.md
+
+# IDE files
+.idea/
+
+# Working dir
+.DS_Store
+.claude
+# Angular / Playwright build and test output
+dist/
+.angular/
+test-results/
+playwright-report/
+e2e/assets/
+.auth/
+out-tsc/
