@@ -14,6 +14,11 @@ functionality. Grouped by the direction they would take the project.
 - [ ] **Nullable vs. optional** — `(0 - 1)` means "may be absent"; JSON `null`
   is a distinct concept (`nullable: true`). Matters for PATCH-like semantics
   ("field present but null = clear it").
+- [ ] **Structural inheritance without a discriminator** — `extended by` only
+  yields `class Sub extends Base` when the hierarchy carries a `discriminator`;
+  otherwise openapi-generator flattens the `allOf` into a standalone class that
+  repeats the base properties. Documented as-is for now; making it uniform would
+  mean either always emitting a discriminator or requiring one for `extended by`.
 - [ ] **Documentation attributes** — `description`, `example`, `default` in the
   `{...}` attribute block (deliberately deferred when the validation set was
   chosen); flows into Javadoc on the generated DTOs.
@@ -39,11 +44,13 @@ functionality. Grouped by the direction they would take the project.
 ## Tooling / polish
 
 - [ ] **`uniqueItems`** (Set semantics) as an occurrence or attribute option.
-- [ ] **Duplicate property names** are silently last-wins; should be a
-  line-numbered error like the other rules.
-- [ ] **Quote-aware comment stripping** — a `pattern` (or import path)
-  containing `#` or `//` is currently truncated by the comment stripper;
-  workaround exists (`[#]` in the regex), a real fix would honor quotes.
+- [ ] **Non-ASCII property names** are rejected by the name pattern
+  (`[A-Za-z_][A-Za-z0-9_-]*`); fine for the demo, but a JSON payload may carry
+  them.
+- [ ] **Inline-enum name collisions** — openapi-generator names the inner enum
+  of a property `x` `XEnum`; a *named* type called `XEnum` in the same document
+  is then shadowed by it inside that DTO. The define-once/name rules cannot see
+  this, since the colliding name is synthesized downstream.
 - [ ] **License headers on generated sources** — generated DTOs under
   `target/` are RAT-excluded; if headers are wanted there too, use the
   openapi-generator template/license options (not RAT).

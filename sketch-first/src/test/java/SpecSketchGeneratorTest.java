@@ -13,11 +13,17 @@
  */
 
 import java.util.List;
+import java.util.Map;
 
+import io.swagger.v3.parser.OpenAPIV3Parser;
+import io.swagger.v3.parser.core.models.ParseOptions;
+import io.swagger.v3.parser.core.models.SwaggerParseResult;
 import org.junit.jupiter.api.Test;
+import org.yaml.snakeyaml.Yaml;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -25,14 +31,62 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * Tests the SpecSketch -> OpenAPI translation directly (no Maven plugin involved):
  * request/response parts, all occurrence forms, and the indentation/nesting rules.
  *
+ * Every document produced by {@link #generate} additionally goes through
+ * {@link #assertProcessableOpenApi}: swagger-parser (the parser openapi-generator itself uses)
+ * must accept it without a single message, and SnakeYAML - a strict YAML 1.1 reader - must see
+ * the same document with string keys only. That way a sketch can never yield a YAML file the
+ * downstream toolchain rejects, no matter which test introduced it.
+ *
  * SpecSketchGenerator lives in src/main/tools (default package) and is added as a
  * source root via the build-helper-maven-plugin, so this test can call it and
- * the module jar can run it (java -jar target/sketch-first-*.jar).
+ * the module jar can run it (java -jar target/sketch-first-*.jar). It stays dependency-free -
+ * the parsers above are test-scoped.
  */
 class SpecSketchGeneratorTest {
 
     private static String generate(String... specLines) {
-        return SpecSketchGenerator.generateYaml(List.of(specLines), "sample");
+        String yaml = SpecSketchGenerator.generateYaml(List.of(specLines), "sample");
+        assertProcessableOpenApi(yaml);
+        return yaml;
+    }
+
+    /**
+     * Asserts that the emitted YAML is a valid OpenAPI 3 document. External $refs are not
+     * resolved: an 'import' without a known path deliberately emits a TODO placeholder pointing
+     * at a file that does not exist yet, and that is the one thing this check must tolerate.
+     */
+    private static void assertProcessableOpenApi(String yaml) {
+        assertYaml11Compatible(yaml);
+
+        ParseOptions options = new ParseOptions();
+        options.setResolve(false);
+        SwaggerParseResult result = new OpenAPIV3Parser().readContents(yaml, null, options);
+        assertTrue(result.getMessages().isEmpty(),
+                () -> "swagger-parser rejected the document: " + result.getMessages() + "\n" + yaml);
+        assertNotNull(result.getOpenAPI(), () -> "swagger-parser produced no model for:\n" + yaml);
+    }
+
+    /**
+     * A YAML 1.1 parser resolves unquoted 'on', 'no', 'yes', 'null', ... to booleans/null - also
+     * as mapping KEYS. Any non-string key means a property or schema name lost its identity.
+     */
+    private static void assertYaml11Compatible(String yaml) {
+        Object document = new Yaml().load(yaml);
+        assertStringKeys(document, "$", yaml);
+    }
+
+    private static void assertStringKeys(Object node, String path, String yaml) {
+        if (node instanceof Map<?, ?> map) {
+            for (Map.Entry<?, ?> entry : map.entrySet()) {
+                assertTrue(entry.getKey() instanceof String,
+                        () -> "non-string YAML key " + entry.getKey() + " (" + path + ") in:\n" + yaml);
+                assertStringKeys(entry.getValue(), path + "." + entry.getKey(), yaml);
+            }
+        } else if (node instanceof List<?> list) {
+            for (int i = 0; i < list.size(); i++) {
+                assertStringKeys(list.get(i), path + "[" + i + "]", yaml);
+            }
+        }
     }
 
     /**
@@ -432,6 +486,51 @@ class SpecSketchGeneratorTest {
                 "    x (1) : string /* oops"), "not closed on the same line");
     }
 
+    @Test
+    void commentMarkersInsideQuotedValuesArePartOfTheValue() {
+        // '#' and '//' used to truncate the line and '/* ... */' silently replaced a slice of the
+        // pattern with a space - a wrong regex that reached the DTO without any warning
+        String yaml = generate(
+                "response (1) : Res",
+                "    color (1) : string {pattern: \"^#[0-9a-f]{6}$\"}",
+                "    url (1) : string {pattern: \"^https://.+$\"}",
+                "    glob (1) : string {pattern: \"^/*x*/$\"}");
+
+        String schema = schema(yaml, "Res");
+        assertTrue(property(schema, "color").contains("pattern: '^#[0-9a-f]{6}$'"));
+        assertTrue(property(schema, "url").contains("pattern: '^https://.+$'"));
+        assertTrue(property(schema, "glob").contains("pattern: '^/*x*/$'"));
+    }
+
+    @Test
+    void importPathsMayContainCommentMarkers() {
+        String yaml = generate(
+                "import Money from \"https://example.com/common.yaml\"",
+                "response (1) : Res",
+                "    total (1) : Money");
+
+        assertTrue(yaml.contains("'https://example.com/common.yaml#/components/schemas/Money'"));
+    }
+
+    @Test
+    void commentsAfterAQuotedValueStillCount() {
+        String withComment = generate(
+                "response (1) : Res",
+                "    code (1) : string {pattern: \"^[a-z]+$\"}  // the trailing comment");
+        String clean = generate(
+                "response (1) : Res",
+                "    code (1) : string {pattern: \"^[a-z]+$\"}");
+
+        assertEquals(clean, withComment);
+    }
+
+    @Test
+    void unterminatedQuoteIsRejected() {
+        assertSpecFailure(() -> generate(
+                "response (1) : Res",
+                "    code (1) : string {pattern: \"^[a-z]+$}"), "unterminated double quote");
+    }
+
     // ---------------------------------------------------------- type mapping
 
     @Test
@@ -517,13 +616,25 @@ class SpecSketchGeneratorTest {
                 "    a (1) : Detail",
                 "        x (1) : string",
                 "    b (1) : DETAIL",
-                "        y (1) : string"), "differs only in case from 'Detail' (line 2)");
+                "        y (1) : string"), "differs only in case or underscores from 'Detail' (line 2)");
         // reference vs definition
         assertSpecFailure(() -> generate(
                 "response (1) : T",
                 "    a (1) : Detail",
                 "        x (1) : string",
                 "    b (1) : detail"), "differs only in case");
+    }
+
+    @Test
+    void typeNamesDifferingOnlyInUnderscoresAreRejected() {
+        // openapi-generator camelizes schema names: 'my_type' and 'MyType' would collapse into one
+        // generated class, silently dropping the properties of whichever came first
+        assertSpecFailure(() -> generate(
+                "response (1) : Res",
+                "    a (1) : my_type",
+                "        p (1) : string",
+                "    b (1) : MyType",
+                "        q (1) : string"), "differs only in case or underscores from 'my_type' (line 2)");
     }
 
     // -------------------------------------------------------------- enums
@@ -775,11 +886,44 @@ class SpecSketchGeneratorTest {
         assertSpecFailure(() -> generate(
                 "response (1) : Res",
                 "    a (1) : Base",
+                "        common (1) : string",
                 "        extended by Sub",
                 "            x (1) : string",
                 "    b (1) : Other",
+                "        shared (1) : string",
                 "        extended by Sub",
                 "            y (1) : string"), "already defined");
+        // a base type needs own properties: a property-less schema is a free-form object,
+        // so the DTO generator drops the model and the subtypes lose their base class
+        assertSpecFailure(() -> generate(
+                "response (1) : Res",
+                "    a (1) : Base",
+                "        extended by Sub",
+                "            x (1) : string"), "type 'Base' has no properties");
+        // ... which also rules out a header-only request growing subtypes
+        assertSpecFailure(() -> generate(
+                "request (1) : Req",
+                "    @X-Id (1) : uuid",
+                "    extended by Sub",
+                "        x (1) : string",
+                "response (1) : Res",
+                "    ok (1) : boolean"), "requires the base type to define at least one property");
+        // a subtype block only ADDS properties - re-declaring one of the base chain would
+        // produce a Java subclass whose accessor cannot override its parent's
+        assertSpecFailure(() -> generate(
+                "response (1) : Res",
+                "    a (1) : Base",
+                "        name (1) : string",
+                "        extended by Sub",
+                "            name (1) : int"), "already declared by the base type at line 3");
+        assertSpecFailure(() -> generate(
+                "response (1) : Res",
+                "    a (1) : Base",
+                "        kind (1) : discriminator",
+                "        extended by Mid",
+                "            x (1) : string",
+                "            extended by Leaf",
+                "                kind (1) : string"), "already declared by the base type at line 3");
     }
 
     @Test
@@ -910,6 +1054,138 @@ class SpecSketchGeneratorTest {
         assertSpecFailure(() -> generate(
                 "request (1) : T",
                 "    x (1) : string"), "response");
+    }
+
+    // -------------------------------------------------- valid YAML / valid OpenAPI
+
+    @Test
+    void propertyNamesThatYamlReadsAsBooleansOrNullStayStrings() {
+        // unquoted, 'on'/'yes' both resolve to the boolean true and 'null' to a null key -
+        // openapi-generator fails with "Duplicate field true" / "Null key for a Map not allowed"
+        String yaml = generate(
+                "response (1) : Res",
+                "    on (1) : boolean",
+                "    off (0 - 1) : boolean",
+                "    yes (0 - 1) : string",
+                "    no (0 - 1) : string",
+                "    null (0 - 1) : string",
+                "    y (0 - 1) : string",
+                "    n (0 - 1) : string");
+
+        String schema = schema(yaml, "Res");
+        assertTrue(schema.contains("'on':"));
+        assertTrue(schema.contains("'null':"));
+        // the required list quotes them the same way, so key and entry keep referring to each other
+        assertTrue(block(schema, "required", 6).contains("- 'on'"));
+    }
+
+    @Test
+    void enumValuesThatYamlReadsAsBooleansStayStrings() {
+        String yaml = generate(
+                "response (1) : Res",
+                "    answer (1) : enum [YES, NO]",
+                "    switched (1) : enum [ON, OFF]",
+                "    short (1) : enum [Y, N]");
+
+        String schema = schema(yaml, "Res");
+        assertTrue(property(schema, "answer").contains("- 'YES'"));
+        assertTrue(property(schema, "short").contains("- 'Y'"));
+    }
+
+    @Test
+    void documentWithoutNamedSchemasStaysAValidObject() {
+        // 'schemas:' with nothing below it is null, not a map:
+        // "attribute components.schemas is not of type `object`"
+        String yaml = generate("response (1) : string");
+
+        assertTrue(yaml.contains("schemas: {}"));
+    }
+
+    @Test
+    void headerOnlyRequestEmitsNoSchemaForItsType() {
+        // the type has no body properties, so a schema for it would be an unused free-form object
+        String yaml = generate(
+                "request (1) : Probe",
+                "    @X-Client-Id (1) : uuid",
+                "response (1) : Res",
+                "    ok (1) : boolean");
+
+        assertFalse(yaml.contains("Probe:"));
+        assertTrue(yaml.contains("schemas:"));
+    }
+
+    @Test
+    void typesWithoutPropertiesAreRejected() {
+        assertSpecFailure(() -> generate(
+                "response (1) : Res",
+                "    @X-Only (1) : string"), "has no properties");
+    }
+
+    @Test
+    void duplicatePropertyNamesAreRejected() {
+        // last-wins would silently drop the first property and list it twice under 'required'
+        assertSpecFailure(() -> generate(
+                "response (1) : Res",
+                "    name (1) : string",
+                "    name (1) : int"), "duplicate property 'name' (already declared at line 2)");
+    }
+
+    @Test
+    void duplicateHeaderNamesAreRejected() {
+        // two same-named header parameters make the document invalid ("duplicate parameter values")
+        assertSpecFailure(() -> generate(
+                "request (1) : Req",
+                "    @X-Id (1) : uuid",
+                "    @X-Id (0 - 1) : string",
+                "    body (1) : string",
+                "response (1) : Res",
+                "    ok (1) : boolean"), "duplicate header '@X-Id' (already declared at line 2");
+        // response headers would silently collapse into one instead
+        assertSpecFailure(() -> generate(
+                "response (1) : Res",
+                "    @X-Id (1) : uuid",
+                "    @x-id (0 - 1) : string",
+                "    ok (1) : boolean"), "duplicate header '@x-id'");
+    }
+
+    @Test
+    void numericEnumValuesAreComparedByValueNotByNotation() {
+        // 1.0, 1.00 and 1 are one value: as separate entries they become Java enum constants
+        // sharing the same value, which fromValue() can never reach
+        assertSpecFailure(() -> generate(
+                "response (1) : Res",
+                "    x (1) : enum:double [1.0, 1.00]"), "duplicate enum value '1.00'");
+        assertSpecFailure(() -> generate(
+                "response (1) : Res",
+                "    x (1) : enum:double [1.0, 1]"), "duplicate enum value '1'");
+    }
+
+    @Test
+    void stringAttributesAreRejectedOnFormattedStringTypes() {
+        // date/datetime/uuid map to LocalDate/OffsetDateTime/UUID: @Size and @Pattern on those
+        // throw jakarta.validation.UnexpectedTypeException the first time the DTO is validated
+        assertSpecFailure(() -> generate(
+                "response (1) : Res",
+                "    d (1) : date {minLength: 4}"), "only the plain 'string' type maps to a Java String");
+        assertSpecFailure(() -> generate(
+                "response (1) : Res",
+                "    u (1) : uuid {pattern: \"[0-9a-f-]+\"}"), "not supported on 'uuid'");
+        assertSpecFailure(() -> generate(
+                "response (1) : Res",
+                "    t (1) : Instant {maxLength: 30}"), "not supported on 'Instant'");
+        // the plain string built-in keeps working, in every spelling
+        assertTrue(generate(
+                "response (1) : Res",
+                "    a (1) : string {maxLength: 5}",
+                "    b (1) : String {minLength: 1}").contains("maxLength: 5"));
+    }
+
+    @Test
+    void occurrenceValuesTooLargeForAnIntAreReportedWithTheLine() {
+        // an unguarded Integer.parseInt would escape as a bare NumberFormatException stack trace
+        assertSpecFailure(() -> generate(
+                "response (1) : Res",
+                "    x (99999999999) : string"), "line 2: occurrence '99999999999' is too large");
     }
 
     private static int countOccurrences(String text, String needle) {

@@ -39,8 +39,12 @@ import java.util.regex.Pattern;
  *             usage references it by name, resulting in a single schema plus
  *             $refs in the output (recursive types are possible). A type
  *             without properties is either a built-in or a reference to a type
- *             defined elsewhere in the file. Custom type names are case-sensitive;
- *             two custom types whose names differ only in case are an error.
+ *             defined elsewhere in the file. Every type definition needs at
+ *             least one property: a property-less object schema means 'any
+ *             object' in OpenAPI, so DTO generators drop the model. Property
+ *             names must be unique within a type. Custom type names must differ
+ *             by more than case and underscores ('MyType' vs. 'my_type' would
+ *             collapse into one generated class), the check reports the line.
  *             Built-ins (case-insensitive, so both 'string' and 'String' work):
  *             - OpenAPI-style: string, number, integer, boolean, date, datetime, uuid
  *             - Java primitives/wrappers: int, long, short, byte, char, float,
@@ -49,12 +53,17 @@ import java.util.regex.Pattern;
  *               ZonedDateTime, Instant, LocalTime, OffsetTime
  * Inheritance: inside a type definition a line 'extended by <SubType>' starts
  *             a subtype block; its nested lines are the ADDITIONAL properties
- *             of the subtype (emitted as an allOf composition, which the DTO
- *             generator turns into 'class SubType extends Base'). Subtype
- *             blocks may be nested for deeper hierarchies. Marking one base
- *             property with the reserved type 'discriminator' makes the
+ *             of the subtype, emitted as an allOf composition. Re-declaring a
+ *             property of the base chain is an error - the block only adds.
+ *             Subtype blocks may be nested for deeper hierarchies. Marking one
+ *             base property with the reserved type 'discriminator' makes the
  *             hierarchy polymorphic (discriminator + mapping in the YAML,
- *             Jackson @JsonTypeInfo/@JsonSubTypes in the generated Java):
+ *             Jackson @JsonTypeInfo/@JsonSubTypes in the generated Java) AND is
+ *             what makes the DTO generator emit real Java inheritance
+ *             ('class Car extends Vehicle'). Without a discriminator the allOf
+ *             composition is valid OpenAPI, but openapi-generator flattens it:
+ *             the subtype becomes a standalone class that repeats the base
+ *             properties instead of extending the base class.
  *                 vehicles (0 - *) : Vehicle
  *                     vehicleType (1) : discriminator
  *                     maxSpeed (1) : int
@@ -88,6 +97,7 @@ import java.util.regex.Pattern;
  * repeatable). Request headers become 'in: header' parameters, response headers
  * land in the response's 'headers' section. A request that contains only
  * headers (no body properties) has no request body and stays a GET.
+ * Header names must be unique per part (HTTP header names are case-insensitive).
  * Additional top-level lines may define further reusable types.
  *
  * Imports: a top-level line 'import <TypeName>' declares a type whose details
@@ -106,15 +116,19 @@ import java.util.regex.Pattern;
  *     email (0 - 1) : string {pattern: "^.+@.+$"}
  *     age (0 - 1) : int {min: 0, max: 150}
  * Strings support minLength, maxLength and pattern; numeric types support min
- * and max (aliases: minimum, maximum). Values may be double-quoted (required
- * when they contain commas or braces, e.g. patterns with quantifiers). On
- * arrays the attributes apply to the items - the array bounds already come
- * from the occurrence.
+ * and max (aliases: minimum, maximum). minLength/maxLength/pattern are limited
+ * to the plain 'string' type: date, datetime, uuid and the java.time built-ins
+ * become non-String Java types, where the generated @Size/@Pattern would fail
+ * at validation time. Values may be double-quoted (required when they contain
+ * commas or braces, e.g. patterns with quantifiers). On arrays the attributes
+ * apply to the items - the array bounds already come from the occurrence.
  *
  * Comments: every line may end with a comment introduced by '//', '#' or
  * '/* ... *&#47;' (the block form may also sit mid-line and must be closed on
- * the same line). Lines containing only a comment are ignored at any
- * indentation and never affect the nesting. Blank lines are ignored as well.
+ * the same line). Comment markers inside a double-quoted value are part of the
+ * value, so patterns and import paths may contain '#', '//' and '/*'. Lines
+ * containing only a comment are ignored at any indentation and never affect the
+ * nesting. Blank lines are ignored as well.
  *
  * Usage: java SpecSketchGenerator.java <input.sketch> [<output.yaml> | -]
  *        With only the input path the YAML is saved next to the input file as
@@ -316,27 +330,44 @@ public final class SpecSketchGenerator {
         return roots;
     }
 
-    /** Removes '//' and '#' comments (rest of line) and single-line '/* ... *&#47;' block comments. */
+    /**
+     * Removes '//' and '#' comments (rest of line) and single-line '/* ... *&#47;' block comments.
+     * Comment markers inside a double-quoted value are kept, so patterns and import paths may
+     * contain '#', '//' and '/*' (e.g. {pattern: "^#[0-9a-f]{6}$"} or a https:// import path).
+     */
     private static String stripComments(String text, int lineNo) {
         StringBuilder result = new StringBuilder();
+        boolean inQuotes = false;
         int i = 0;
         while (i < text.length()) {
             char c = text.charAt(i);
-            boolean hasNext = i + 1 < text.length();
-            if (c == '#' || (c == '/' && hasNext && text.charAt(i + 1) == '/')) {
-                break;
-            }
-            if (c == '/' && hasNext && text.charAt(i + 1) == '*') {
-                int end = text.indexOf("*/", i + 2);
-                if (end < 0) {
-                    throw new SpecException("line " + lineNo + ": block comment '/*' is not closed on the same line");
-                }
-                result.append(' ');
-                i = end + 2;
+            if (c == '"') {
+                inQuotes = !inQuotes;
+                result.append(c);
+                i++;
                 continue;
+            }
+            if (!inQuotes) {
+                boolean hasNext = i + 1 < text.length();
+                if (c == '#' || (c == '/' && hasNext && text.charAt(i + 1) == '/')) {
+                    break;
+                }
+                if (c == '/' && hasNext && text.charAt(i + 1) == '*') {
+                    int end = text.indexOf("*/", i + 2);
+                    if (end < 0) {
+                        throw new SpecException("line " + lineNo
+                                + ": block comment '/*' is not closed on the same line");
+                    }
+                    result.append(' ');
+                    i = end + 2;
+                    continue;
+                }
             }
             result.append(c);
             i++;
+        }
+        if (inQuotes) {
+            throw new SpecException("line " + lineNo + ": unterminated double quote");
         }
         return result.toString();
     }
@@ -357,9 +388,9 @@ public final class SpecSketchGenerator {
         if (!m.matches()) {
             throw new SpecException("line " + lineNo + ": expected '<name> (<occurrence>) : <type>', got: " + body);
         }
-        int min = Integer.parseInt(m.group(2));
+        int min = parseOccurrence(m.group(2), lineNo);
         String maxToken = m.group(3);
-        int max = maxToken == null ? min : maxToken.equals("*") ? UNBOUNDED : Integer.parseInt(maxToken);
+        int max = maxToken == null ? min : maxToken.equals("*") ? UNBOUNDED : parseOccurrence(maxToken, lineNo);
         if (max != UNBOUNDED && max < min) {
             throw new SpecException("line " + lineNo + ": maximum occurrence " + max + " is smaller than minimum " + min);
         }
@@ -380,6 +411,16 @@ public final class SpecSketchGenerator {
         boolean isHeader = rawName.startsWith("@");
         return new Node(lineNo, isHeader ? rawName.substring(1) : rawName, isHeader, false, false, null,
                 min, max, type, enumValueType, enumName, enumValues, attributes);
+    }
+
+    /** The regex only guarantees digits, so the single failure mode is an int overflow. */
+    private static int parseOccurrence(String token, int lineNo) {
+        try {
+            return Integer.parseInt(token);
+        } catch (NumberFormatException e) {
+            throw new SpecException("line " + lineNo + ": occurrence '" + token + "' is too large (maximum "
+                    + Integer.MAX_VALUE + ")");
+        }
     }
 
     // ------------------------------------------------------------ attributes
@@ -404,6 +445,9 @@ public final class SpecSketchGenerator {
                     + ": attributes are only supported on built-in types, not on type references");
         }
         String family = (String) builtIn.get("type"); // string | integer | number | boolean
+        // only the plain 'string' built-in becomes a Java String: date/datetime/uuid/... carry a
+        // format and map to java.time/UUID values, where @Size/@Pattern cannot be validated
+        boolean plainString = family.equals("string") && !builtIn.containsKey("format");
         Map<String, Object> attributes = new LinkedHashMap<>();
         for (String part : splitAttributes(body)) {
             if (part.isBlank()) {
@@ -417,16 +461,11 @@ public final class SpecSketchGenerator {
             String value = unquote(part.substring(colon + 1).trim());
             String canonical = switch (key.toLowerCase()) {
                 case "minlength", "maxlength" -> {
-                    if (!family.equals("string")) {
-                        throw new SpecException("line " + lineNo + ": '" + key + "' is only allowed on string types"
-                                + " (use min/max for numeric ranges)");
-                    }
+                    requirePlainString(key, type, family, plainString, lineNo, " (use min/max for numeric ranges)");
                     yield key.toLowerCase().equals("minlength") ? "minLength" : "maxLength";
                 }
                 case "pattern" -> {
-                    if (!family.equals("string")) {
-                        throw new SpecException("line " + lineNo + ": 'pattern' is only allowed on string types");
-                    }
+                    requirePlainString(key, type, family, plainString, lineNo, "");
                     yield "pattern";
                 }
                 case "min", "minimum", "max", "maximum" -> {
@@ -447,6 +486,24 @@ public final class SpecSketchGenerator {
         checkAttributeBounds(attributes, "minLength", "maxLength", lineNo);
         checkAttributeBounds(attributes, "minimum", "maximum", lineNo);
         return attributes;
+    }
+
+    /**
+     * minLength/maxLength/pattern are only meaningful where the type ends up as a Java String -
+     * on a date or uuid the generated @Size/@Pattern would fail with an UnexpectedTypeException
+     * the first time the DTO is validated.
+     */
+    private static void requirePlainString(String key, String type, String family, boolean plainString,
+                                           int lineNo, String numericHint) {
+        if (plainString) {
+            return;
+        }
+        if (!family.equals("string")) {
+            throw new SpecException("line " + lineNo + ": '" + key + "' is only allowed on string types" + numericHint);
+        }
+        throw new SpecException("line " + lineNo + ": '" + key + "' is not supported on '" + type
+                + "' - only the plain 'string' type maps to a Java String (formatted types like date,"
+                + " datetime or uuid become java.time/UUID values, where the constraint cannot be validated)");
     }
 
     /** Splits on commas outside double quotes, so quoted values may contain commas. */
@@ -536,12 +593,30 @@ public final class SpecSketchGenerator {
                 case "number" -> parseEnumNumber(text, "-?\\d+(\\.\\d+)?", lineNo);
                 default -> parseEnumString(text, lineNo);
             };
-            if (values.contains(value)) {
+            if (containsEnumValue(values, value)) {
                 throw new SpecException("line " + lineNo + ": duplicate enum value '" + text + "'");
             }
             values.add(value);
         }
         return values;
+    }
+
+    /**
+     * Numeric values are compared by value, not by representation: BigDecimal.equals() is
+     * scale-sensitive, so '1.0', '1.00' and '1' would all pass as distinct enum entries and
+     * produce Java enum constants that share one value.
+     */
+    private static boolean containsEnumValue(List<Object> values, Object candidate) {
+        for (Object existing : values) {
+            if (existing instanceof java.math.BigDecimal a && candidate instanceof java.math.BigDecimal b) {
+                if (a.compareTo(b) == 0) {
+                    return true;
+                }
+            } else if (existing.equals(candidate)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private static Object parseEnumNumber(String text, String pattern, int lineNo) {
@@ -560,46 +635,24 @@ public final class SpecSketchGenerator {
 
     // ------------------------------------------------------- schema generation
 
+    /** The document-wide type registries filled by the definition pass. */
+    private static final class Registry {
+        final Map<String, Map<String, Object>> schemas = new LinkedHashMap<>();
+        final Map<String, Integer> definedAt = new LinkedHashMap<>();
+        final Map<String, Spelling> firstSpelling = new LinkedHashMap<>(); // normalized name -> first occurrence
+        final Map<String, Node> references = new LinkedHashMap<>();
+        final Map<String, Node> imports = new LinkedHashMap<>(); // imported name -> its 'import' line
+    }
+
     private static String generate(List<Node> roots, String baseName) {
-        Map<String, Map<String, Object>> schemas = new LinkedHashMap<>();
-        Map<String, Integer> definedAt = new LinkedHashMap<>();
-        Map<String, Spelling> firstSpelling = new LinkedHashMap<>(); // lowercase name -> first occurrence
-        Map<String, Node> references = new LinkedHashMap<>();
-        Map<String, Node> imports = new LinkedHashMap<>(); // imported name -> its 'import' line
-        for (Node root : roots) {
-            if (!root.isImport) {
-                continue;
-            }
-            if (!root.children.isEmpty()) {
-                throw new SpecException("line " + root.lineNo + ": imported type '" + root.type
-                        + "' must not define properties (its details live in the external file)");
-            }
-            if (BUILT_INS.containsKey(root.type.toLowerCase()) || root.type.equalsIgnoreCase("discriminator")) {
-                throw new SpecException("line " + root.lineNo + ": '" + root.type
-                        + "' is a built-in type and cannot be imported");
-            }
-            checkCaseCollision(root.type, root.lineNo, firstSpelling);
-            if (imports.putIfAbsent(root.type, root) != null) {
-                throw new SpecException("line " + root.lineNo + ": type '" + root.type + "' is already imported");
-            }
-        }
-        for (Node root : roots) {
-            if (!root.isImport) {
-                defineTypes(root, schemas, definedAt, firstSpelling, references, imports);
-            }
-        }
-        for (Map.Entry<String, Node> ref : references.entrySet()) {
-            if (!schemas.containsKey(ref.getKey()) && !imports.containsKey(ref.getKey())) {
-                throw new SpecException("line " + ref.getValue().lineNo + ": type '" + ref.getKey()
-                        + "' is used but never defined (define its properties at one of its usages, or import it)");
-            }
-        }
+        Registry registry = new Registry();
+        collectImports(roots, registry);
 
         Node request = null;
         Node response = null;
         for (Node root : roots) {
             if (root.isImport) {
-                continue; // collected below, after the registries exist
+                continue;
             }
             if (root.name.equals("request")) {
                 if (request != null) {
@@ -616,13 +669,27 @@ public final class SpecSketchGenerator {
         if (response == null) {
             throw new SpecException("missing top-level 'response' definition");
         }
-
         validateHeaderPlacement(roots, request, response);
+
+        // the request is the only part that may consist of headers alone (-> no body, no schema)
+        for (Node root : roots) {
+            if (!root.isImport) {
+                defineTypes(root, registry, root == request);
+            }
+        }
+        for (Map.Entry<String, Node> ref : registry.references.entrySet()) {
+            if (!registry.schemas.containsKey(ref.getKey()) && !registry.imports.containsKey(ref.getKey())) {
+                throw new SpecException("line " + ref.getValue().lineNo + ": type '" + ref.getKey()
+                        + "' is used but never defined (define its properties at one of its usages, or import it)");
+            }
+        }
+
+        Map<String, Map<String, Object>> schemas = registry.schemas;
+        Map<String, Node> imports = registry.imports;
         List<Node> requestHeaders = request == null ? List.of() : headerChildren(request);
         List<Node> responseHeaders = headerChildren(response);
         // a request whose children are all '@' headers has no body and stays a GET
-        boolean hasBody = request != null
-                && (request.children.isEmpty() || request.children.size() > requestHeaders.size());
+        boolean hasBody = request != null && (request.children.isEmpty() || !bodyChildren(request).isEmpty());
 
         Map<String, Object> okResponse = new LinkedHashMap<>();
         okResponse.put("description", "Generated from SpecSketch definition '" + response.name + "'");
@@ -677,14 +744,71 @@ public final class SpecSketchGenerator {
         return sb.toString();
     }
 
-    private static List<Node> headerChildren(Node node) {
-        List<Node> headers = new ArrayList<>();
-        for (Node child : node.children) {
-            if (child.isHeader) {
-                headers.add(child);
+    private static void collectImports(List<Node> roots, Registry registry) {
+        for (Node root : roots) {
+            if (!root.isImport) {
+                continue;
+            }
+            if (!root.children.isEmpty()) {
+                throw new SpecException("line " + root.lineNo + ": imported type '" + root.type
+                        + "' must not define properties (its details live in the external file)");
+            }
+            if (BUILT_INS.containsKey(root.type.toLowerCase()) || root.type.equalsIgnoreCase("discriminator")) {
+                throw new SpecException("line " + root.lineNo + ": '" + root.type
+                        + "' is a built-in type and cannot be imported");
+            }
+            checkCaseCollision(root.type, root.lineNo, registry);
+            if (registry.imports.putIfAbsent(root.type, root) != null) {
+                throw new SpecException("line " + root.lineNo + ": type '" + root.type + "' is already imported");
             }
         }
+    }
+
+    /**
+     * The '@' headers of 'request'/'response'. Duplicates are rejected: two same-named header
+     * parameters make the document invalid, and two same-named response headers would silently
+     * collapse into one. HTTP header names are case-insensitive, so the check is too.
+     */
+    private static List<Node> headerChildren(Node node) {
+        List<Node> headers = new ArrayList<>();
+        Map<String, Node> seen = new LinkedHashMap<>();
+        for (Node child : node.children) {
+            if (!child.isHeader) {
+                continue;
+            }
+            Node first = seen.putIfAbsent(child.name.toLowerCase(), child);
+            if (first != null) {
+                throw new SpecException("line " + child.lineNo + ": duplicate header '@" + child.name
+                        + "' (already declared at line " + first.lineNo
+                        + "; HTTP header names are case-insensitive)");
+            }
+            headers.add(child);
+        }
         return headers;
+    }
+
+    /** The children that become body properties: neither '@' headers nor 'extended by' markers. */
+    private static List<Node> bodyChildren(Node node) {
+        List<Node> body = new ArrayList<>();
+        for (Node child : node.children) {
+            if (!child.isHeader && !child.isSubtypeMarker) {
+                body.add(child);
+            }
+        }
+        return body;
+    }
+
+    /** The body properties of one type/subtype block by name, rejecting duplicates. */
+    private static Map<String, Node> declaredProperties(Node node) {
+        Map<String, Node> properties = new LinkedHashMap<>();
+        for (Node child : bodyChildren(node)) {
+            Node first = properties.putIfAbsent(child.name, child);
+            if (first != null) {
+                throw new SpecException("line " + child.lineNo + ": duplicate property '" + child.name
+                        + "' (already declared at line " + first.lineNo + ")");
+            }
+        }
+        return properties;
     }
 
     private static void validateHeaderPlacement(List<Node> roots, Node request, Node response) {
@@ -716,17 +840,15 @@ public final class SpecSketchGenerator {
                 + "' is only allowed directly below 'request' or 'response'");
     }
 
-    private static void defineTypes(Node node, Map<String, Map<String, Object>> schemas,
-                                    Map<String, Integer> definedAt, Map<String, Spelling> firstSpelling,
-                                    Map<String, Node> references, Map<String, Node> imports) {
+    private static void defineTypes(Node node, Registry registry, boolean isRequestRoot) {
         if (node.children.isEmpty()) {
             if (node.enumName != null) {
-                defineNamedEnum(node, schemas, definedAt, firstSpelling, imports);
+                defineNamedEnum(node, registry);
             } else if (node.enumValues == null
                     && !node.type.equalsIgnoreCase("discriminator")
                     && !BUILT_INS.containsKey(node.type.toLowerCase())) {
-                checkCaseCollision(node.type, node.lineNo, firstSpelling);
-                references.putIfAbsent(node.type, node);
+                checkCaseCollision(node.type, node.lineNo, registry);
+                registry.references.putIfAbsent(node.type, node);
             }
             return;
         }
@@ -741,59 +863,89 @@ public final class SpecSketchGenerator {
             throw new SpecException("line " + node.lineNo + ": built-in type '" + node.type
                     + "' cannot have nested properties");
         }
-        checkCaseCollision(node.type, node.lineNo, firstSpelling);
-        if (imports.containsKey(node.type)) {
+        checkCaseCollision(node.type, node.lineNo, registry);
+        if (registry.imports.containsKey(node.type)) {
             throw new SpecException("line " + node.lineNo + ": type '" + node.type
-                    + "' is imported (line " + imports.get(node.type).lineNo
+                    + "' is imported (line " + registry.imports.get(node.type).lineNo
                     + ") - its details are defined in the external file");
         }
         // a type's details are defined exactly once, at its first occurrence with properties
-        if (schemas.containsKey(node.type)) {
+        if (registry.schemas.containsKey(node.type)) {
             throw new SpecException("line " + node.lineNo + ": type '" + node.type
-                    + "' is already defined at line " + definedAt.get(node.type)
+                    + "' is already defined at line " + registry.definedAt.get(node.type)
                     + " - later occurrences must reference it by name, without nested properties");
         }
         List<Node> subtypes = subtypeMarkers(node);
+        Map<String, Node> properties = declaredProperties(node);
+        if (properties.isEmpty()) {
+            // an object schema without properties means 'any object' in OpenAPI: the DTO generator
+            // drops the model, so references to it degrade to Object and subtypes lose their base
+            if (!isRequestRoot) {
+                throw new SpecException("line " + node.lineNo + ": type '" + node.type
+                        + "' has no properties - every type definition needs at least one property"
+                        + " (a property-less schema is a free-form object for OpenAPI tooling)");
+            }
+            if (!subtypes.isEmpty()) {
+                throw new SpecException("line " + subtypes.get(0).lineNo
+                        + ": 'extended by' requires the base type to define at least one property");
+            }
+            // a header-only request has no body, hence no schema - but its header types still count
+            for (Node child : node.children) {
+                defineTypes(child, registry, false);
+            }
+            return;
+        }
         Node discriminator = validateDiscriminator(node, subtypes);
-        Map<String, Object> schema = objectSchema(node, imports);
+        Map<String, Object> schema = objectSchema(node, registry.imports);
         if (discriminator != null) {
             schema.put("discriminator", discriminatorSchema(discriminator, subtypes));
         }
-        schemas.put(node.type, schema);
-        definedAt.put(node.type, node.lineNo);
+        registry.schemas.put(node.type, schema);
+        registry.definedAt.put(node.type, node.lineNo);
         for (Node child : node.children) {
             if (child.isSubtypeMarker) {
-                defineSubtype(child, node.type, schemas, definedAt, firstSpelling, references, imports);
+                defineSubtype(child, node.type, properties, registry);
             } else {
-                defineTypes(child, schemas, definedAt, firstSpelling, references, imports);
+                defineTypes(child, registry, false);
             }
         }
     }
 
-    /** A subtype = allOf(base, additional properties); registered like any other named type. */
-    private static void defineSubtype(Node marker, String baseName, Map<String, Map<String, Object>> schemas,
-                                      Map<String, Integer> definedAt, Map<String, Spelling> firstSpelling,
-                                      Map<String, Node> references, Map<String, Node> imports) {
+    /**
+     * A subtype = allOf(base, additional properties); registered like any other named type.
+     * {@code inherited} carries the property names of the whole base chain: re-declaring one of
+     * them would produce a Java subclass that cannot override its parent's accessor.
+     */
+    private static void defineSubtype(Node marker, String baseName, Map<String, Node> inherited, Registry registry) {
         String subName = marker.type;
         if (BUILT_INS.containsKey(subName.toLowerCase()) || subName.equalsIgnoreCase("discriminator")) {
             throw new SpecException("line " + marker.lineNo + ": subtype name '" + subName
                     + "' collides with a built-in type");
         }
-        checkCaseCollision(subName, marker.lineNo, firstSpelling);
-        if (imports.containsKey(subName)) {
+        checkCaseCollision(subName, marker.lineNo, registry);
+        if (registry.imports.containsKey(subName)) {
             throw new SpecException("line " + marker.lineNo + ": type '" + subName
-                    + "' is imported (line " + imports.get(subName).lineNo
+                    + "' is imported (line " + registry.imports.get(subName).lineNo
                     + ") - its details are defined in the external file");
         }
-        if (schemas.containsKey(subName)) {
+        if (registry.schemas.containsKey(subName)) {
             throw new SpecException("line " + marker.lineNo + ": type '" + subName
-                    + "' is already defined at line " + definedAt.get(subName));
+                    + "' is already defined at line " + registry.definedAt.get(subName));
+        }
+        Map<String, Node> additionalProperties = declaredProperties(marker);
+        for (Map.Entry<String, Node> property : additionalProperties.entrySet()) {
+            Node base = inherited.get(property.getKey());
+            if (base != null) {
+                throw new SpecException("line " + property.getValue().lineNo + ": property '" + property.getKey()
+                        + "' is already declared by the base type at line " + base.lineNo
+                        + " - a subtype block only adds properties");
+            }
         }
         List<Node> subtypes = subtypeMarkers(marker);
         Node discriminator = validateDiscriminator(marker, subtypes);
         List<Object> allOf = new ArrayList<>();
         allOf.add(map("$ref", "#/components/schemas/" + baseName));
-        Map<String, Object> additional = objectSchema(marker, imports);
+        Map<String, Object> additional = objectSchema(marker, registry.imports);
         if (additional.containsKey("properties") || additional.containsKey("required")) {
             allOf.add(additional);
         }
@@ -802,13 +954,15 @@ public final class SpecSketchGenerator {
         if (discriminator != null) {
             schema.put("discriminator", discriminatorSchema(discriminator, subtypes));
         }
-        schemas.put(subName, schema);
-        definedAt.put(subName, marker.lineNo);
+        registry.schemas.put(subName, schema);
+        registry.definedAt.put(subName, marker.lineNo);
+        Map<String, Node> chain = new LinkedHashMap<>(inherited);
+        chain.putAll(additionalProperties);
         for (Node child : marker.children) {
             if (child.isSubtypeMarker) {
-                defineSubtype(child, subName, schemas, definedAt, firstSpelling, references, imports);
+                defineSubtype(child, subName, chain, registry);
             } else {
-                defineTypes(child, schemas, definedAt, firstSpelling, references, imports);
+                defineTypes(child, registry, false);
             }
         }
     }
@@ -866,47 +1020,48 @@ public final class SpecSketchGenerator {
     }
 
     /** A named enum joins the type registry like an object type: defined once, referenced by name. */
-    private static void defineNamedEnum(Node node, Map<String, Map<String, Object>> schemas,
-                                        Map<String, Integer> definedAt, Map<String, Spelling> firstSpelling,
-                                        Map<String, Node> imports) {
+    private static void defineNamedEnum(Node node, Registry registry) {
         if (BUILT_INS.containsKey(node.enumName.toLowerCase())) {
             throw new SpecException("line " + node.lineNo + ": enum name '" + node.enumName
                     + "' collides with a built-in type");
         }
-        checkCaseCollision(node.enumName, node.lineNo, firstSpelling);
-        if (imports.containsKey(node.enumName)) {
+        checkCaseCollision(node.enumName, node.lineNo, registry);
+        if (registry.imports.containsKey(node.enumName)) {
             throw new SpecException("line " + node.lineNo + ": type '" + node.enumName
-                    + "' is imported (line " + imports.get(node.enumName).lineNo
+                    + "' is imported (line " + registry.imports.get(node.enumName).lineNo
                     + ") - its details are defined in the external file");
         }
-        if (schemas.containsKey(node.enumName)) {
+        if (registry.schemas.containsKey(node.enumName)) {
             throw new SpecException("line " + node.lineNo + ": type '" + node.enumName
-                    + "' is already defined at line " + definedAt.get(node.enumName)
+                    + "' is already defined at line " + registry.definedAt.get(node.enumName)
                     + " - later occurrences must reference it by name, without values");
         }
-        schemas.put(node.enumName, enumSchema(node, imports));
-        definedAt.put(node.enumName, node.lineNo);
+        registry.schemas.put(node.enumName, enumSchema(node, registry.imports));
+        registry.definedAt.put(node.enumName, node.lineNo);
     }
 
     private record Spelling(String name, int lineNo) {
     }
 
-    /** Custom type names are case-sensitive - names that differ only in case are almost certainly typos. */
-    private static void checkCaseCollision(String typeName, int lineNo, Map<String, Spelling> firstSpelling) {
-        Spelling first = firstSpelling.putIfAbsent(typeName.toLowerCase(), new Spelling(typeName, lineNo));
+    /**
+     * Custom type names must differ by more than case and underscores. Names differing only in
+     * case are almost certainly typos, and OpenAPI tooling camelizes schema names, so 'my_type'
+     * and 'MyType' would collapse into a single generated class - silently losing one of them.
+     */
+    private static void checkCaseCollision(String typeName, int lineNo, Registry registry) {
+        String normalized = typeName.toLowerCase().replace("_", "");
+        Spelling first = registry.firstSpelling.putIfAbsent(normalized, new Spelling(typeName, lineNo));
         if (first != null && !first.name().equals(typeName)) {
             throw new SpecException("line " + lineNo + ": type '" + typeName
-                    + "' differs only in case from '" + first.name() + "' (line " + first.lineNo() + ")");
+                    + "' differs only in case or underscores from '" + first.name()
+                    + "' (line " + first.lineNo() + ")");
         }
     }
 
     private static Map<String, Object> objectSchema(Node node, Map<String, Node> imports) {
         List<String> required = new ArrayList<>();
         Map<String, Object> properties = new LinkedHashMap<>();
-        for (Node child : node.children) {
-            if (child.isHeader || child.isSubtypeMarker) {
-                continue; // headers and subtype blocks are not body properties
-            }
+        for (Node child : declaredProperties(node).values()) {
             if (child.min >= 1) {
                 required.add(child.name);
             }
@@ -999,6 +1154,10 @@ public final class SpecSketchGenerator {
     private static void emitList(StringBuilder sb, List<?> list, int depth) {
         for (Object element : list) {
             if (element instanceof Map<?, ?> map) {
+                if (map.isEmpty()) {
+                    sb.append("  ".repeat(depth)).append("- {}\n");
+                    continue;
+                }
                 boolean first = true;
                 for (Map.Entry<?, ?> entry : map.entrySet()) {
                     // first entry inline after the dash, the rest aligned below it
@@ -1016,9 +1175,19 @@ public final class SpecSketchGenerator {
     private static void emitEntry(StringBuilder sb, String key, Object value, int depth) {
         sb.append(yamlKey(key)).append(":");
         if (value instanceof Map<?, ?> nested) {
+            // an empty block would emit a bare 'key:', i.e. null - not the object/array the
+            // OpenAPI schema demands (e.g. 'components.schemas is not of type object')
+            if (nested.isEmpty()) {
+                sb.append(" {}\n");
+                return;
+            }
             sb.append("\n");
             emitMap(sb, (Map<String, ?>) nested, depth + 1);
         } else if (value instanceof List<?> list) {
+            if (list.isEmpty()) {
+                sb.append(" []\n");
+                return;
+            }
             sb.append("\n");
             emitList(sb, list, depth + 1);
         } else {
@@ -1026,8 +1195,17 @@ public final class SpecSketchGenerator {
         }
     }
 
+    /**
+     * Words a YAML 1.1 parser resolves to a boolean or null when they are not quoted - as KEYS
+     * too, so a property named 'on' would silently turn into the boolean 'true'.
+     */
+    private static boolean isReservedYamlWord(String s) {
+        return s.matches("(?i)y|n|yes|no|true|false|on|off|null|~");
+    }
+
     private static String yamlKey(String key) {
-        return key.matches("[A-Za-z_][A-Za-z0-9_.-]*") ? key : "'" + key.replace("'", "''") + "'";
+        boolean plainSafe = key.matches("[A-Za-z_][A-Za-z0-9_.-]*") && !isReservedYamlWord(key);
+        return plainSafe ? key : yamlQuoted(key);
     }
 
     private static String yamlScalar(Object value) {
@@ -1036,7 +1214,11 @@ public final class SpecSketchGenerator {
         }
         String s = String.valueOf(value);
         boolean plainSafe = s.matches("[A-Za-z0-9_][A-Za-z0-9_ .-]*")
-                && !s.matches("(?i)true|false|null|yes|no|on|off|~|\\d+");
-        return plainSafe ? s : "'" + s.replace("'", "''") + "'";
+                && !isReservedYamlWord(s) && !s.matches("\\d+");
+        return plainSafe ? s : yamlQuoted(s);
+    }
+
+    private static String yamlQuoted(String s) {
+        return "'" + s.replace("'", "''") + "'";
     }
 }

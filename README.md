@@ -114,10 +114,13 @@ Rules:
   and the output contains a single schema plus `$ref`s (recursive types work too). A type
   without properties is either a built-in or a reference to a type defined elsewhere in the
   file (see `favorite`, which reuses `Pet` — the request above references the `Category`
-  defined later in the response part).
+  defined later in the response part). Property names must be unique within a type, and every
+  type definition needs at least one property: a property-less object schema means "any object"
+  in OpenAPI, so DTO generators drop the model and references to it degrade to `Object`.
 - **Built-in types** (case-insensitive — `string`, `String` and `STRING` are the same; custom
-  type names on the other hand are case-sensitive, and two custom types whose names differ
-  only in case are rejected as an error): OpenAPI-style `string`, `number`, `integer`,
+  type names on the other hand must differ by more than case *and* underscores, since OpenAPI
+  tooling camelizes schema names — `my_type` and `MyType` would collapse into one generated
+  class, so they are rejected as an error): OpenAPI-style `string`, `number`, `integer`,
   `boolean`, `date`, `datetime`, `uuid`; Java primitives and wrappers `int`, `long`, `short`,
   `byte`, `char`, `float`, `double`, `boolean`, `String`, `BigDecimal`, `BigInteger`; and the
   java.time classes `LocalDate`, `LocalDateTime`, `OffsetDateTime`, `ZonedDateTime`,
@@ -133,13 +136,16 @@ Rules:
   `stars (1) : enum:int [1, 2, 3, 4, 5]` produces a numeric enum.
 - **Inheritance:** inside a type definition, `extended by <SubType>` starts a subtype block
   whose nested lines are the *additional* properties (the wording follows the reading
-  direction: the base is extended by its subtypes). Subtypes become `allOf` compositions (the
-  DTO generator turns them into `class Car extends Vehicle`), join the type registry
-  (referable, define-once, case rules) and may be nested for deeper hierarchies. Marking one
-  base property with the reserved type `discriminator` makes the hierarchy polymorphic: the
-  property becomes a required string, the schema gets `discriminator` + a mapping of all
-  transitive subtypes, and the generated Java carries `@JsonTypeInfo`/`@JsonSubTypes` — so
-  JSON deserializes into the concrete subtype:
+  direction: the base is extended by its subtypes). Re-declaring a property of the base chain
+  is an error — the block only adds. Subtypes become `allOf` compositions, join the type
+  registry (referable, define-once, name rules) and may be nested for deeper hierarchies.
+  Marking one base property with the reserved type `discriminator` makes the hierarchy
+  polymorphic: the property becomes a required string, the schema gets `discriminator` + a
+  mapping of all transitive subtypes, and the generated Java carries
+  `@JsonTypeInfo`/`@JsonSubTypes` — so JSON deserializes into the concrete subtype. **The
+  discriminator is also what produces real Java inheritance** (`class Car extends Vehicle`):
+  without it the `allOf` composition is still valid OpenAPI, but openapi-generator flattens it
+  into a standalone class that repeats the base properties instead of extending the base class.
   ```
   vehicles (0 - *) : Vehicle
       vehicleType (1) : discriminator
@@ -166,7 +172,8 @@ Rules:
   any type works — built-ins, inline or named enums. Request headers become `in: header`
   parameters, response headers land in the response's `headers` section. A request that
   contains only headers has no body and stays a GET, so header definitions work without
-  forcing a POST.
+  forcing a POST. Header names must be unique per part — HTTP header names are
+  case-insensitive, so `@X-Id` and `@x-id` count as the same header.
 - **Imports:** a top-level `import <TypeName>` declares a type whose details already live in a
   shared/common yaml file — no local schema is generated; every usage becomes an external
   `$ref` with a type-specific placeholder meant for manual post-editing:
@@ -178,25 +185,39 @@ Rules:
   Defining properties for an imported type is an error; imports join the type registry
   (define-once, case rules).
 - **Attributes:** a property line may end with an optional `{key: value, …}` validation block,
-  checked against the property's type: strings support `minLength`, `maxLength` and `pattern`,
-  numeric types `min`/`max` (aliases `minimum`/`maximum`). Values may be double-quoted —
-  required when they contain commas or braces (`{pattern: "^[a-z]{2,3}$"}`). On arrays the
-  attributes apply to the *items* (the array bounds already come from the occurrence). The DTO
-  generator turns them into Bean Validation annotations:
-  `name (1) : string {minLength: 1, maxLength: 100}` → `@Size(min = 1, max = 100)`.
+  checked against the property's type: `minLength`, `maxLength` and `pattern` for the plain
+  `string` type, `min`/`max` (aliases `minimum`/`maximum`) for numeric types. The string
+  attributes are deliberately *not* allowed on `date`, `datetime`, `uuid` or the java.time
+  built-ins: those become `LocalDate`/`OffsetDateTime`/`UUID` fields, where the generated
+  `@Size`/`@Pattern` would throw `UnexpectedTypeException` the first time the DTO is validated.
+  Values may be double-quoted — required when they contain commas or braces
+  (`{pattern: "^[a-z]{2,3}$"}`). On arrays the attributes apply to the *items* (the array
+  bounds already come from the occurrence). The DTO generator turns them into Bean Validation
+  annotations: `name (1) : string {minLength: 1, maxLength: 100}` → `@Size(min = 1, max = 100)`.
 - **Comments:** every line may end with a comment via `//`, `#` or `/* … */` (the block form
-  may also sit mid-line, closed on the same line). Comment-only lines are ignored at *any*
-  indentation, so they never affect the nesting. Blank lines are ignored as well.
-- Errors (broken indentation, undefined types, conflicting redefinitions) are reported with
-  line numbers and fail the build.
+  may also sit mid-line, closed on the same line). Comment markers inside a double-quoted
+  value belong to the value, so patterns and import paths may contain `#`, `//` and `/*`
+  (`{pattern: "^#[0-9a-f]{6}$"}`, `import Money from "https://…/common.yaml"`). Comment-only
+  lines are ignored at *any* indentation, so they never affect the nesting. Blank lines are
+  ignored as well.
+- Errors (broken indentation, undefined types, conflicting redefinitions, duplicate property or
+  header names, attributes on a type that cannot carry them) are reported with line numbers and
+  fail the build — the guiding rule is that a sketch either fails with a line number or yields
+  an OpenAPI document the toolchain accepts, never a silently wrong one.
 
 The translation itself is covered by
 [`SpecSketchGeneratorTest`](sketch-first/src/test/java/SpecSketchGeneratorTest.java)
 (request/response variants, every occurrence form, Java primitive/wrapper and java.time
 type mapping, deep nesting, multi-level implicit dedents, tab indentation, type reuse
-including recursive types, and the error cases). The generator is compiled
-into the module's *test* sources via the `build-helper-maven-plugin`, so it stays out
-of the produced jar.
+including recursive types, and the error cases). Every document a test generates is
+additionally run through **swagger-parser** — the same parser `openapi-generator` uses, which
+must accept it without a single message — and through **SnakeYAML** as a strict YAML 1.1
+reader, which must see string keys only (unquoted `on`, `yes` or `null` would otherwise turn
+a property name into a boolean or null). Both are test-scoped: the generator itself stays
+dependency-free. External `$ref`s are not resolved, because an `import` without a known path
+deliberately emits a `TODO-IMPORT` placeholder pointing at a file that does not exist yet.
+The generator is compiled into the module's *test* sources via the
+`build-helper-maven-plugin`, so it stays out of the produced jar.
 
 The Maven build chains two steps in the `generate-sources` phase:
 

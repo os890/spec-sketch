@@ -54,7 +54,28 @@
     <jakarta.annotation-api.version>2.1.1</jakarta.annotation-api.version>
     <jackson.version>2.17.2</jackson.version>
     <junit.version>5.10.3</junit.version>
+    <!-- test-only: validates the generated OpenAPI documents (same parser openapi-generator uses) -->
+    <swagger-parser.version>2.1.28</swagger-parser.version>
+    <snakeyaml.version>2.4</snakeyaml.version>
+    <slf4j.version>2.0.17</slf4j.version>
   </properties>
+
+  <dependencyManagement>
+    <dependencies>
+      <!--
+        Keeps the whole Jackson family on one version. Without it the test-scoped swagger-parser
+        drags in jackson-dataformat-yaml/jackson-annotations from a newer line than the pinned
+        jackson-databind, and the resulting mix fails with a NoSuchMethodError inside the parser.
+      -->
+      <dependency>
+        <groupId>com.fasterxml.jackson</groupId>
+        <artifactId>jackson-bom</artifactId>
+        <version>${jackson.version}</version>
+        <type>pom</type>
+        <scope>import</scope>
+      </dependency>
+    </dependencies>
+  </dependencyManagement>
 
   <!-- both modules use the identical dependency set -->
   <dependencies>

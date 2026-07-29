@@ -29,6 +29,33 @@
   <name>sketch-first</name>
   <description>DTO generation from a custom SpecSketch DSL, translated to OpenAPI YAML by a single-file Java generator</description>
 
+  <dependencies>
+    <!--
+      Test-only: every generated document is parsed with the same swagger-parser that
+      openapi-generator uses, plus SnakeYAML as a strict YAML 1.1 reader. The generator itself
+      stays dependency-free (JDK only) - these never end up on the runtime classpath.
+    -->
+    <dependency>
+      <groupId>io.swagger.parser.v3</groupId>
+      <artifactId>swagger-parser-v3</artifactId>
+      <version>${swagger-parser.version}</version>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.yaml</groupId>
+      <artifactId>snakeyaml</artifactId>
+      <version>${snakeyaml.version}</version>
+      <scope>test</scope>
+    </dependency>
+    <!-- swagger-parser logs via slf4j; pinned so the whole test classpath uses one API version -->
+    <dependency>
+      <groupId>org.slf4j</groupId>
+      <artifactId>slf4j-api</artifactId>
+      <version>${slf4j.version}</version>
+      <scope>test</scope>
+    </dependency>
+  </dependencies>
+
   <build>
     <plugins>
       <!--
