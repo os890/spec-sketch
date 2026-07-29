@@ -103,12 +103,18 @@ import java.util.regex.Pattern;
  * Imports: a top-level line 'import <TypeName>' declares a type whose details
  * live in an existing shared/common yaml file - no local schema is generated,
  * every usage becomes an external $ref with a type-specific placeholder meant
- * for manual post-editing:
+ * to be filled in:
  *     import Address
  *     ->  $ref: 'TODO-IMPORT/Address.yaml#/components/schemas/Address'
- * If the file is already known, 'import Address from "common/types.yaml"'
- * emits the real ref instead. Defining properties for an imported type is an
- * error; imports join the type registry (define-once, case rules).
+ * A pathless import is reported with its line, because no OpenAPI tool can
+ * resolve the placeholder. Filling the path into the RESULT file works too:
+ * the next run adopts it back into the sketch's 'import' line, so the sketch
+ * stays the single source of truth. If the file is already known,
+ * 'import Address from "common/types.yaml"' emits the real ref right away.
+ * Paths are relative to the SKETCH; when the yaml is written to a different
+ * directory they are rebased, so a sketch never has to know where it lands.
+ * Defining properties for an imported type is an error; imports join the type
+ * registry (define-once, name rules).
  *
  * Attributes: a property line may end with an optional {key: value, ...} block
  * holding validation attributes, validated against the property's type:
@@ -132,8 +138,13 @@ import java.util.regex.Pattern;
  *
  * Usage: java SpecSketchGenerator.java <input.sketch> [<output.yaml> | -]
  *        With only the input path the YAML is saved next to the input file as
- *        <input-basename>.yaml; a second argument sets an explicit output path;
- *        '-' prints to stdout instead.
+ *        <input-basename>.yaml - sketch and result side by side, which is the
+ *        normal layout: both are version-controlled, neither belongs to a build
+ *        output folder. A second argument sets an explicit output path (that is
+ *        what the Maven build does, writing into target/); '-' prints to stdout.
+ *        An existing result file is overwritten, but if its content differed it
+ *        is reported - in a repository the overwrite shows up as a change to
+ *        review, and it used to happen without any trace.
  *        (No build step needed thanks to the JDK source launcher; a plain
  *        'javac SpecSketchGenerator.java' works as well since there are no
  *        dependencies outside the JDK.)
@@ -246,26 +257,197 @@ public final class SpecSketchGenerator {
         }
         Path input = Path.of(args[0]);
         try {
-            String baseName = input.getFileName().toString().replaceFirst("\\.[^.]+$", "");
-            String yaml = generateYaml(Files.readAllLines(input), baseName);
+            if (!Files.isReadable(input)) {
+                throw new SpecException(Files.exists(input) ? "input file is not readable" : "input file not found");
+            }
             if (args.length == 2 && args[1].equals("-")) {
-                System.out.print(yaml);
+                System.out.print(generateYaml(Files.readAllLines(input), baseNameOf(input)));
                 return;
             }
             // default: save the YAML in the same path as the input file
-            Path output = args.length == 2 ? Path.of(args[1]) : input.resolveSibling(baseName + ".yaml");
-            if (output.toAbsolutePath().normalize().equals(input.toAbsolutePath().normalize())) {
-                throw new SpecException("output path would overwrite the input file: " + output);
+            Path output = args.length == 2 ? Path.of(args[1]) : input.resolveSibling(baseNameOf(input) + ".yaml");
+            List<String> messages = new ArrayList<>();
+            boolean written = translate(input, output, messages);
+            for (String message : messages) {
+                System.err.println("SpecSketchGenerator: " + message);
             }
-            if (output.getParent() != null) {
-                Files.createDirectories(output.getParent());
+            if (written) {
+                System.out.println("SpecSketchGenerator: " + input + " -> " + output);
             }
-            Files.writeString(output, yaml);
-            System.out.println("SpecSketchGenerator: " + input + " -> " + output);
         } catch (SpecException e) {
             System.err.println("SpecSketchGenerator: " + input + ": " + e.getMessage());
             System.exit(1);
+        } catch (IOException e) {
+            System.err.println("SpecSketchGenerator: " + input + ": " + e);
+            System.exit(1);
         }
+    }
+
+    static String baseNameOf(Path input) {
+        return input.getFileName().toString().replaceFirst("\\.[^.]+$", "");
+    }
+
+    /**
+     * File-level translation. In real use the sketch and its yaml sit in the SAME directory,
+     * both outside any build output folder - the yaml is a durable artifact, not a throwaway.
+     * Hence two things happen here that a pure text translation would not do:
+     * <ul>
+     *   <li>if a TODO-IMPORT placeholder was filled in with a real path in the result file, that
+     *       path is adopted back into the sketch's 'import' line, so the sketch stays the single
+     *       source of truth and a fresh clone regenerates the same document;</li>
+     *   <li>overwriting a result file that differs is allowed (the file is version-controlled, so
+     *       it simply becomes a change to review), but it is reported instead of happening
+     *       silently - previously any manual edit vanished without a trace.</li>
+     * </ul>
+     * Import paths are written relative to the sketch; if the output goes somewhere else they are
+     * rebased, so a sketch never has to know where its yaml lands.
+     *
+     * @return whether the result file was written (false if it was already up to date)
+     */
+    static boolean translate(Path input, Path output, List<String> messages) throws IOException {
+        if (output.toAbsolutePath().normalize().equals(input.toAbsolutePath().normalize())) {
+            throw new SpecException("output path would overwrite the input file: " + output);
+        }
+        Path sketchDir = directoryOf(input);
+        Path outputDir = directoryOf(output);
+        List<String> lines = Files.readAllLines(input);
+        String existing = Files.exists(output) ? Files.readString(output) : null;
+
+        String yaml = generateYaml(rebaseImportPaths(lines, sketchDir, outputDir), baseNameOf(input));
+        if (existing != null) {
+            Map<String, String> resolved = resolvedImportPaths(existing, yaml);
+            if (!resolved.isEmpty()) {
+                List<String> updated = applyImportPaths(lines, resolved, outputDir, sketchDir, messages);
+                Files.write(input, updated);
+                lines = updated;
+                yaml = generateYaml(rebaseImportPaths(lines, sketchDir, outputDir), baseNameOf(input));
+            }
+        }
+        warnAboutPathlessImports(lines, messages);
+        if (yaml.equals(existing)) {
+            messages.add(output + " is already up to date");
+            return false;
+        }
+        if (existing != null) {
+            messages.add("warning: " + output + " differed from the sketch and was overwritten"
+                    + " - review the change before committing it");
+        }
+        if (output.getParent() != null) {
+            Files.createDirectories(output.getParent());
+        }
+        Files.writeString(output, yaml);
+        return true;
+    }
+
+    /**
+     * A pathless import emits a TODO-IMPORT placeholder, which no OpenAPI tool can resolve - the
+     * build fails deep inside the generator with a path that says nothing about the sketch.
+     */
+    static void warnAboutPathlessImports(List<String> lines, List<String> messages) {
+        for (int i = 0; i < lines.size(); i++) {
+            Matcher m = IMPORT_LINE.matcher(stripComments(lines.get(i), i + 1).trim());
+            if (m.matches() && m.group(2) == null) {
+                messages.add("warning: line " + (i + 1) + ": import '" + m.group(1) + "' has no path yet"
+                        + " - the result file gets a TODO-IMPORT placeholder that OpenAPI tooling cannot"
+                        + " resolve; add: import " + m.group(1) + " from \"<file>\"");
+            }
+        }
+    }
+
+    private static Path directoryOf(Path file) {
+        Path parent = file.toAbsolutePath().normalize().getParent();
+        return parent != null ? parent : Path.of("").toAbsolutePath();
+    }
+
+    // ------------------------------------------------------------ import paths
+
+    /** A ref emitted for an 'import' without a path - the part meant to be filled in. */
+    private static final Pattern PLACEHOLDER_REF = Pattern.compile(
+            "'TODO-IMPORT/([A-Za-z_][A-Za-z0-9_]*)\\.yaml#/components/schemas/\\1'");
+
+    /**
+     * Import paths are written relative to the SKETCH, but the emitted $ref is resolved relative
+     * to the RESULT FILE. Both live in the same directory in normal use, so nothing happens; only
+     * an output redirected elsewhere (as the Maven build does) needs the rebase.
+     */
+    static List<String> rebaseImportPaths(List<String> lines, Path sketchDir, Path outputDir) {
+        if (sketchDir.equals(outputDir)) {
+            return lines;
+        }
+        List<String> rebased = new ArrayList<>(lines.size());
+        for (int i = 0; i < lines.size(); i++) {
+            String raw = lines.get(i);
+            String path = importPathOf(raw, i + 1);
+            rebased.add(path == null ? raw : replaceQuotedValue(raw, rebase(path, sketchDir, outputDir)));
+        }
+        return rebased;
+    }
+
+    /** Types whose placeholder ref carries a real path in the existing result file. */
+    static Map<String, String> resolvedImportPaths(String existingYaml, String freshYaml) {
+        Map<String, String> resolved = new LinkedHashMap<>();
+        Matcher placeholder = PLACEHOLDER_REF.matcher(freshYaml);
+        while (placeholder.find()) {
+            String type = placeholder.group(1);
+            Matcher filledIn = Pattern.compile("'([^']+)#/components/schemas/" + type + "'").matcher(existingYaml);
+            if (filledIn.find() && !filledIn.group(1).equals("TODO-IMPORT/" + type + ".yaml")) {
+                resolved.putIfAbsent(type, filledIn.group(1));
+            }
+        }
+        return resolved;
+    }
+
+    /** Writes the adopted paths into the pathless 'import' lines, keeping trailing comments. */
+    static List<String> applyImportPaths(List<String> lines, Map<String, String> pathsRelativeToOutput,
+                                         Path outputDir, Path sketchDir, List<String> messages) {
+        List<String> updated = new ArrayList<>(lines);
+        for (Map.Entry<String, String> resolved : pathsRelativeToOutput.entrySet()) {
+            String type = resolved.getKey();
+            String path = rebase(resolved.getValue(), outputDir, sketchDir);
+            for (int i = 0; i < updated.size(); i++) {
+                String raw = updated.get(i);
+                Matcher m = IMPORT_LINE.matcher(stripComments(raw, i + 1).trim());
+                if (!m.matches() || !m.group(1).equals(type) || m.group(2) != null) {
+                    continue;
+                }
+                updated.set(i, insertFromClause(raw, type, path));
+                messages.add("line " + (i + 1) + ": adopted the path filled in for 'import " + type
+                        + "' into the sketch: from \"" + path + "\"");
+                break;
+            }
+        }
+        return updated;
+    }
+
+    private static String rebase(String path, Path fromDir, Path toDir) {
+        if (fromDir.equals(toDir) || isAbsoluteOrUrl(path)) {
+            return path;
+        }
+        return toDir.relativize(fromDir.resolve(path).normalize()).toString().replace('\\', '/');
+    }
+
+    private static boolean isAbsoluteOrUrl(String path) {
+        return path.startsWith("/")
+                || path.matches("(?i)[a-z][a-z0-9+.-]*://.*") // http://, https://, file://
+                || path.matches("(?i)[a-z]:[/\\\\].*");       // windows drive letter
+    }
+
+    /** The 'from "..."' path of an import line, or null if this is not a path-carrying import. */
+    private static String importPathOf(String raw, int lineNo) {
+        Matcher m = IMPORT_LINE.matcher(stripComments(raw, lineNo).trim());
+        return m.matches() ? m.group(2) : null;
+    }
+
+    private static String replaceQuotedValue(String raw, String value) {
+        int start = raw.indexOf('"');
+        int end = raw.indexOf('"', start + 1);
+        return raw.substring(0, start + 1) + value + raw.substring(end);
+    }
+
+    private static String insertFromClause(String raw, String type, String path) {
+        int afterKeyword = raw.indexOf("import") + "import".length();
+        int afterType = raw.indexOf(type, afterKeyword) + type.length();
+        return raw.substring(0, afterType) + " from \"" + path + "\"" + raw.substring(afterType);
     }
 
     /** Entry point for tests and for {@link #main}: SpecSketch lines in, OpenAPI YAML out. */
@@ -284,6 +466,9 @@ public final class SpecSketchGenerator {
         List<Node> stack = new ArrayList<>(); // stack.get(i) = currently open node at depth i
         for (int i = 0; i < lines.size(); i++) {
             String raw = lines.get(i);
+            if (i == 0 && !raw.isEmpty() && raw.charAt(0) == '﻿') {
+                raw = raw.substring(1); // a UTF-8 BOM would make the first line unparseable
+            }
             if (raw.isBlank()) {
                 continue;
             }
@@ -787,6 +972,10 @@ public final class SpecSketchGenerator {
         return headers;
     }
 
+    private static String indentedBelow(Node node) {
+        return " (line " + node.children.get(0).lineNo + " is indented below it)";
+    }
+
     /** The children that become body properties: neither '@' headers nor 'extended by' markers. */
     private static List<Node> bodyChildren(Node node) {
         List<Node> body = new ArrayList<>();
@@ -852,16 +1041,19 @@ public final class SpecSketchGenerator {
             }
             return;
         }
+        // these three name the indented line as well: the mistake is almost always there, not here
         if (node.enumValues != null) {
-            throw new SpecException("line " + node.lineNo + ": an enum cannot have nested properties");
+            throw new SpecException("line " + node.lineNo + ": an enum cannot have nested properties"
+                    + indentedBelow(node));
         }
         if (node.type.equalsIgnoreCase("discriminator")) {
             throw new SpecException("line " + node.lineNo
-                    + ": 'discriminator' is a reserved type and cannot have nested properties");
+                    + ": 'discriminator' is a reserved type and cannot have nested properties"
+                    + indentedBelow(node));
         }
         if (BUILT_INS.containsKey(node.type.toLowerCase())) {
             throw new SpecException("line " + node.lineNo + ": built-in type '" + node.type
-                    + "' cannot have nested properties");
+                    + "' cannot have nested properties" + indentedBelow(node));
         }
         checkCaseCollision(node.type, node.lineNo, registry);
         if (registry.imports.containsKey(node.type)) {

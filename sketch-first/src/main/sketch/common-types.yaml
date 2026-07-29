@@ -11,8 +11,9 @@
 # limitations under the License.
 
 # Shared/common type definitions, referenced from SpecSketch via:
-#   import Money from "../../src/main/sketch/common-types.yaml"
-# (the path is relative to the generated target/generated-openapi/petstore.yaml)
+#   import Money from "common-types.yaml"
+# (the path is relative to the sketch file; the generator rebases it if the yaml is
+#  written somewhere else, as the Maven build does with target/generated-openapi/)
 openapi: 3.0.3
 info:
   title: shared common types

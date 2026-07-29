@@ -38,7 +38,7 @@
 # imports:     'import <Type>' declares an externally defined type (usages
 #              become $refs; without 'from "..."' a TODO placeholder is used)
 
-import Money from "../../src/main/sketch/common-types.yaml"
+import Money from "common-types.yaml"   // relative to THIS sketch, wherever the yaml is written
 
 request (1) : CreatePetRequest              // with a request body the operation becomes a POST
     @X-Request-Id (0 - 1) : uuid            // custom request header

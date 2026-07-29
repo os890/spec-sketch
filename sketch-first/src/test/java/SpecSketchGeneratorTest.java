@@ -12,6 +12,10 @@
  * limitations under the License.
  */
 
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 
@@ -19,6 +23,7 @@ import io.swagger.v3.parser.OpenAPIV3Parser;
 import io.swagger.v3.parser.core.models.ParseOptions;
 import io.swagger.v3.parser.core.models.SwaggerParseResult;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 import org.yaml.snakeyaml.Yaml;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -1186,6 +1191,170 @@ class SpecSketchGeneratorTest {
         assertSpecFailure(() -> generate(
                 "response (1) : Res",
                 "    x (99999999999) : string"), "line 2: occurrence '99999999999' is too large");
+    }
+
+    // ------------------------------------------- file handling / import paths
+
+    /**
+     * The real-world layout: sketch and result yaml side by side, outside any build folder,
+     * both under version control. That makes the yaml a durable artifact, so the generator has
+     * to reconcile with it instead of truncating it blindly.
+     */
+    @Test
+    void yamlIsWrittenNextToTheSketchAndImportPathsAreSketchRelative(@TempDir Path dir) throws IOException {
+        Path sketch = dir.resolve("petstore.sketch");
+        Files.write(sketch, List.of(
+                "import Money from \"common-types.yaml\"",
+                "response (1) : Pet",
+                "    price (1) : Money"));
+        List<String> messages = new ArrayList<>();
+
+        SpecSketchGenerator.translate(sketch, dir.resolve("petstore.yaml"), messages);
+
+        String yaml = Files.readString(dir.resolve("petstore.yaml"));
+        assertTrue(yaml.contains("'common-types.yaml#/components/schemas/Money'"));
+        assertTrue(messages.isEmpty(), () -> "unexpected messages: " + messages);
+    }
+
+    @Test
+    void importPathsAreRebasedWhenTheYamlIsWrittenElsewhere(@TempDir Path dir) throws IOException {
+        Path sketch = dir.resolve("api/petstore.sketch");
+        Files.createDirectories(sketch.getParent());
+        Files.write(sketch, List.of(
+                "import Money from \"common-types.yaml\"  // relative to the sketch",
+                "response (1) : Pet",
+                "    price (1) : Money"));
+
+        SpecSketchGenerator.translate(sketch, dir.resolve("build/gen/petstore.yaml"), new ArrayList<>());
+
+        // the $ref is resolved relative to the RESULT file, so it must point back at the sketch dir
+        String yaml = Files.readString(dir.resolve("build/gen/petstore.yaml"));
+        assertTrue(yaml.contains("'../../api/common-types.yaml#/components/schemas/Money'"), yaml);
+        // the sketch itself is untouched
+        assertEquals("import Money from \"common-types.yaml\"  // relative to the sketch",
+                Files.readAllLines(sketch).get(0));
+    }
+
+    @Test
+    void absolutePathsAndUrlsAreNotRebased(@TempDir Path dir) throws IOException {
+        Path sketch = dir.resolve("api/petstore.sketch");
+        Files.createDirectories(sketch.getParent());
+        Files.write(sketch, List.of(
+                "import Money from \"https://example.com/common.yaml\"",
+                "response (1) : Pet",
+                "    price (1) : Money"));
+
+        SpecSketchGenerator.translate(sketch, dir.resolve("build/petstore.yaml"), new ArrayList<>());
+
+        assertTrue(Files.readString(dir.resolve("build/petstore.yaml"))
+                .contains("'https://example.com/common.yaml#/components/schemas/Money'"));
+    }
+
+    @Test
+    void aPathFilledInInTheResultFileIsAdoptedBackIntoTheSketch(@TempDir Path dir) throws IOException {
+        Path sketch = dir.resolve("petstore.sketch");
+        Path yaml = dir.resolve("petstore.yaml");
+        Files.write(sketch, List.of(
+                "import Money            // path still unknown",
+                "response (1) : Pet",
+                "    price (1) : Money"));
+        SpecSketchGenerator.translate(sketch, yaml, new ArrayList<>());
+        assertTrue(Files.readString(yaml).contains("TODO-IMPORT/Money.yaml"));
+
+        // the user replaces the placeholder in the result file, as the TODO invites them to
+        Files.writeString(yaml, Files.readString(yaml)
+                .replace("TODO-IMPORT/Money.yaml", "common-types.yaml"));
+
+        List<String> messages = new ArrayList<>();
+        SpecSketchGenerator.translate(sketch, yaml, messages);
+
+        // ... and the sketch keeps it, so it survives every later run and a fresh clone
+        assertEquals("import Money from \"common-types.yaml\"            // path still unknown",
+                Files.readAllLines(sketch).get(0));
+        assertTrue(messages.stream().anyMatch(m -> m.contains("line 1: adopted the path filled in")),
+                () -> messages.toString());
+        assertFalse(Files.readString(yaml).contains("TODO-IMPORT"));
+
+        // idempotent: nothing left to adopt, nothing left to change
+        List<String> second = new ArrayList<>();
+        SpecSketchGenerator.translate(sketch, yaml, second);
+        assertTrue(second.stream().anyMatch(m -> m.contains("already up to date")), () -> second.toString());
+    }
+
+    @Test
+    void overwritingAModifiedResultFileIsReported(@TempDir Path dir) throws IOException {
+        Path sketch = dir.resolve("petstore.sketch");
+        Path yaml = dir.resolve("petstore.yaml");
+        Files.write(sketch, List.of("response (1) : Pet", "    id (1) : long"));
+        SpecSketchGenerator.translate(sketch, yaml, new ArrayList<>());
+
+        // a hand edit the sketch cannot express - it used to vanish without a trace
+        Files.writeString(yaml, Files.readString(yaml) + "# HAND-EDITED\n");
+        List<String> messages = new ArrayList<>();
+        SpecSketchGenerator.translate(sketch, yaml, messages);
+
+        assertFalse(Files.readString(yaml).contains("HAND-EDITED"));
+        assertTrue(messages.stream().anyMatch(m -> m.startsWith("warning:") && m.contains("was overwritten")),
+                () -> messages.toString());
+    }
+
+    @Test
+    void anUnchangedResultFileIsLeftAlone(@TempDir Path dir) throws IOException {
+        Path sketch = dir.resolve("petstore.sketch");
+        Path yaml = dir.resolve("petstore.yaml");
+        Files.write(sketch, List.of("response (1) : Pet", "    id (1) : long"));
+        SpecSketchGenerator.translate(sketch, yaml, new ArrayList<>());
+
+        List<String> messages = new ArrayList<>();
+        SpecSketchGenerator.translate(sketch, yaml, messages);
+
+        assertEquals(List.of(yaml + " is already up to date"), messages);
+    }
+
+    @Test
+    void aPathlessImportIsReportedWithItsSketchLine(@TempDir Path dir) throws IOException {
+        Path sketch = dir.resolve("petstore.sketch");
+        Files.write(sketch, List.of(
+                "# a sketch in progress",
+                "import Money",
+                "response (1) : Pet",
+                "    price (1) : Money"));
+        List<String> messages = new ArrayList<>();
+
+        SpecSketchGenerator.translate(sketch, dir.resolve("petstore.yaml"), messages);
+
+        assertTrue(messages.stream().anyMatch(m -> m.contains("line 2: import 'Money' has no path yet")),
+                () -> messages.toString());
+    }
+
+    @Test
+    void writingOverTheSketchItselfIsRejected(@TempDir Path dir) throws IOException {
+        Path sketch = dir.resolve("petstore.sketch");
+        Files.write(sketch, List.of("response (1) : Pet", "    id (1) : long"));
+
+        SpecSketchGenerator.SpecException e = assertThrows(SpecSketchGenerator.SpecException.class,
+                () -> SpecSketchGenerator.translate(sketch, sketch, new ArrayList<>()));
+        assertTrue(e.getMessage().contains("would overwrite the input file"));
+    }
+
+    @Test
+    void aUtf8BomOnTheFirstLineIsIgnored() {
+        // editors on Windows like to add one, and it made line 1 unparseable
+        String yaml = SpecSketchGenerator.generateYaml(
+                List.of("﻿response (1) : Res", "    x (1) : string"), "sample");
+
+        assertProcessableOpenApi(yaml);
+        assertTrue(schema(yaml, "Res").contains("x"));
+    }
+
+    @Test
+    void aPropertyIndentedBelowAScalarNamesTheOffendingLine() {
+        // the error used to point at the parent line, not at the line that is wrongly indented
+        assertSpecFailure(() -> generate(
+                "response (1) : Res",
+                "    x (1) : string",
+                "        y (1) : string"), "line 2: built-in type 'string' cannot have nested properties"
+                + " (line 3 is indented below it)");
     }
 
     private static int countOccurrences(String text, String needle) {

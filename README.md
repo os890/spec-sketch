@@ -176,14 +176,19 @@ Rules:
   case-insensitive, so `@X-Id` and `@x-id` count as the same header.
 - **Imports:** a top-level `import <TypeName>` declares a type whose details already live in a
   shared/common yaml file — no local schema is generated; every usage becomes an external
-  `$ref` with a type-specific placeholder meant for manual post-editing:
-  `$ref: 'TODO-IMPORT/Address.yaml#/components/schemas/Address'` (grep for `TODO-IMPORT`,
-  replace the file part). If the file is already known,
-  `import Money from "../common-types.yaml"` emits the real ref directly — the petstore spec
+  `$ref` with a type-specific placeholder to be filled in:
+  `$ref: 'TODO-IMPORT/Address.yaml#/components/schemas/Address'`. A pathless import is
+  reported with its sketch line, since no OpenAPI tool can resolve that placeholder. You can
+  fill the path into the **result file** instead — the next run adopts it back into the
+  sketch's `import` line (reporting the change), so the sketch stays the single source of
+  truth and a fresh clone regenerates the same document. If the file is already known,
+  `import Money from "common-types.yaml"` emits the real ref right away — the petstore sketch
   does exactly that with [`common-types.yaml`](sketch-first/src/main/sketch/common-types.yaml),
   and the DTO generator resolves the external file and generates `Money.java` from it.
-  Defining properties for an imported type is an error; imports join the type registry
-  (define-once, case rules).
+  **Paths are relative to the sketch**, not to the result file: when the yaml is written to a
+  different directory (as the Maven build does, into `target/`) the generator rebases them, so
+  a sketch never has to know where its yaml lands. Defining properties for an imported type is
+  an error; imports join the type registry (define-once, name rules).
 - **Attributes:** a property line may end with an optional `{key: value, …}` validation block,
   checked against the property's type: `minLength`, `maxLength` and `pattern` for the plain
   `string` type, `min`/`max` (aliases `minimum`/`maximum`) for numeric types. The string
@@ -244,6 +249,33 @@ java -jar sketch-first/target/sketch-first-1.0.0-SNAPSHOT.jar my-api.sketch     
 java -jar sketch-first/target/sketch-first-1.0.0-SNAPSHOT.jar my-api.sketch out/api.yaml # explicit output path
 java -jar sketch-first/target/sketch-first-1.0.0-SNAPSHOT.jar my-api.sketch -            # print to stdout
 ```
+
+The first form is the normal layout: sketch and result yaml side by side, both under version
+control, neither in a build output folder — the yaml is the file you hand to the openapi plugin
+(or to any consumer), so it has to be durable. Because of that the generator reconciles with an
+existing result file instead of truncating it blindly:
+
+```bash
+$ java -jar …jar petstore.sketch            # first run, path not filled in yet
+SpecSketchGenerator: warning: line 1: import 'Money' has no path yet - the result file gets a
+  TODO-IMPORT placeholder that OpenAPI tooling cannot resolve; add: import Money from "<file>"
+SpecSketchGenerator: petstore.sketch -> petstore.yaml
+
+# replace TODO-IMPORT/Money.yaml with common-types.yaml in petstore.yaml, then:
+$ java -jar …jar petstore.sketch
+SpecSketchGenerator: line 1: adopted the path filled in for 'import Money' into the sketch:
+  from "common-types.yaml"                  # the sketch now carries it permanently
+
+$ java -jar …jar petstore.sketch            # nothing changed -> the file is left alone
+SpecSketchGenerator: petstore.yaml is already up to date
+
+$ java -jar …jar petstore.sketch            # after a hand edit the sketch cannot express
+SpecSketchGenerator: warning: petstore.yaml differed from the sketch and was overwritten -
+  review the change before committing it
+```
+
+Overwriting is the default — in a repository it simply becomes a change to review and commit —
+but it is reported, where previously any manual edit vanished without a trace.
 
 The jar is fully self-contained (the generator has no dependencies outside the JDK), so it
 can be copied anywhere and run with any JDK 17+. Note it also contains the module's
