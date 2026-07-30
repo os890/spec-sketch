@@ -1,0 +1,143 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+    Licensed under the Apache License, Version 2.0 (the "License");
+    you may not use this file except in compliance with the License.
+    You may obtain a copy of the License at
+
+        http://www.apache.org/licenses/LICENSE-2.0
+
+    Unless required by applicable law or agreed to in writing, software
+    distributed under the License is distributed on an "AS IS" BASIS,
+    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+    See the License for the specific language governing permissions and
+    limitations under the License.
+-->
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <parent>
+    <groupId>org.os890.sketch</groupId>
+    <artifactId>openapi-jakarta10-dto-demo</artifactId>
+    <version>1.0.0-SNAPSHOT</version>
+  </parent>
+
+  <artifactId>code-first</artifactId>
+  <packaging>jar</packaging>
+
+  <name>code-first</name>
+  <description>Spec generation from hand-written Java: a JAX-RS resource and its model become SpecSketch + OpenAPI YAML</description>
+
+  <dependencies>
+    <!--
+      The standardized OpenAPI annotations (MicroProfile OpenAPI) carry what a Java signature
+      cannot say: the payload behind a bare jakarta.ws.rs.core.Response, and the headers.
+    -->
+    <dependency>
+      <groupId>org.eclipse.microprofile.openapi</groupId>
+      <artifactId>microprofile-openapi-api</artifactId>
+      <version>${microprofile-openapi.version}</version>
+      <scope>provided</scope>
+    </dependency>
+    <!-- SpecSketchGenerator turns the emitted sketch into the yaml, so both can never disagree -->
+    <dependency>
+      <groupId>org.os890.sketch</groupId>
+      <artifactId>sketch-first</artifactId>
+      <version>${project.version}</version>
+    </dependency>
+    <!-- test-only: the generated documents are validated exactly as in sketch-first -->
+    <dependency>
+      <groupId>io.swagger.parser.v3</groupId>
+      <artifactId>swagger-parser-v3</artifactId>
+      <version>${swagger-parser.version}</version>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.yaml</groupId>
+      <artifactId>snakeyaml</artifactId>
+      <version>${snakeyaml.version}</version>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.slf4j</groupId>
+      <artifactId>slf4j-api</artifactId>
+      <version>${slf4j.version}</version>
+      <scope>test</scope>
+    </dependency>
+  </dependencies>
+
+  <build>
+    <plugins>
+      <!--
+        The sketch/yaml pairs below src/main/sketch are generated from the Java model. They are
+        the module's deliverable, so they are versioned instead of thrown away - but like any
+        generated artifact they carry no license header. Scoped to this module, so the
+        hand-written sketches in sketch-first stay under the license check.
+      -->
+      <plugin>
+        <groupId>org.apache.rat</groupId>
+        <artifactId>apache-rat-plugin</artifactId>
+        <configuration>
+          <excludes combine.children="append">
+            <exclude>src/main/sketch/**</exclude>
+          </excludes>
+        </configuration>
+      </plugin>
+      <!--
+        src/main/tools is a source root, like in sketch-first: the generator ships in the module
+        jar and the tests can call it. JavaSketchGenerator lives in the default package so it can
+        use SpecSketchGenerator's file-level entry point.
+      -->
+      <plugin>
+        <groupId>org.codehaus.mojo</groupId>
+        <artifactId>build-helper-maven-plugin</artifactId>
+        <version>3.6.0</version>
+        <executions>
+          <execution>
+            <id>add-generator-source</id>
+            <phase>generate-sources</phase>
+            <goals>
+              <goal>add-source</goal>
+            </goals>
+            <configuration>
+              <sources>
+                <source>${project.basedir}/src/main/tools</source>
+              </sources>
+            </configuration>
+          </execution>
+        </executions>
+      </plugin>
+      <!--
+        Reads the compiled resource class (hence process-classes, after compile) and writes one
+        sketch + yaml pair per endpoint into src/main/sketch - they are the module's deliverable
+        and belong under version control, not into target/. Unchanged files are left alone.
+        createPet returns the generic Response without any annotation, so its payload type is
+        passed in explicitly; getPet declares its own via @ApiResponse.
+      -->
+      <plugin>
+        <groupId>org.codehaus.mojo</groupId>
+        <artifactId>exec-maven-plugin</artifactId>
+        <executions>
+          <execution>
+            <id>generate-sketch-and-yaml</id>
+            <phase>process-classes</phase>
+            <goals>
+              <goal>java</goal>
+            </goals>
+            <configuration>
+              <mainClass>JavaSketchGenerator</mainClass>
+              <classpathScope>compile</classpathScope>
+              <arguments>
+                <argument>org.os890.sketch.petstore.PetResource</argument>
+                <argument>${project.basedir}/src/main/sketch</argument>
+                <argument>--response</argument>
+                <argument>createPet=org.os890.sketch.petstore.model.Pet</argument>
+              </arguments>
+            </configuration>
+          </execution>
+        </executions>
+      </plugin>
+    </plugins>
+  </build>
+</project>

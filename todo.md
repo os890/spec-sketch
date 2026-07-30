@@ -41,7 +41,39 @@ functionality. Grouped by the direction they would take the project.
   the path is derived from the file name, `application/json` is the only
   content type; no `servers`, no security schemes.
 
+## code-first (Java -> SpecSketch -> OpenAPI)
+
+Everything below is a consequence of the DSL gaps above: the Java model states it,
+`JavaSketchGenerator` reports it, but there is no sketch syntax to carry it.
+
+- [ ] **Path and query parameters** — `@PathParam`/`@QueryParam` are reported and dropped;
+  they need the DSL sigils first.
+- [ ] **Error responses** — only the 2xx payload is emitted; a resource's 404/400
+  bodies have no place in a one-operation sketch.
+- [ ] **The real HTTP path** — the yaml path comes from the sketch file name
+  (`/getPet`), not from `@Path` (`/pets/{petId}`); needs the metadata control item.
+- [ ] **One file per endpoint** — a resource with N endpoints yields N sketch/yaml
+  pairs, and shared types are re-declared in each of them. Folds into the
+  "multiple operations per file" item.
+- [ ] **`Map` and `byte[]` members** are reported and dropped (see the map and
+  binary items above).
+- [ ] **Getter-based models** — properties are read from declared fields; a DTO that
+  only exposes getters (no matching field) would come out empty.
+- [ ] **Composition for a shared-fields base** — the common members of a base that
+  is never used in a payload slot are flattened into every subtype, because
+  `extended by` has to sit inside its base and expressing the composition would
+  move the whole model under that base. A top-level `<Sub> extends <Base>` form in
+  the DSL would allow real `allOf` composition without wrecking the tree; today it
+  makes no difference to the generated DTOs, since openapi-generator flattens a
+  non-discriminated `allOf` regardless.
+- [ ] **Subtypes outside the scanned packages** — the scan covers the base's own
+  package plus those of the request/response types (reported as the guess it is);
+  a subtype in a third package needs `@JsonSubTypes`, `sealed` or `--subtypes`.
+  Scanning the whole classpath would find it, at the cost of walking every jar on
+  every run.
+
 ## Tooling / polish
+
 
 - [ ] **`uniqueItems`** (Set semantics) as an occurrence or attribute option.
 - [ ] **Non-ASCII property names** are rejected by the name pattern

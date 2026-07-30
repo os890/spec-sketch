@@ -40,6 +40,8 @@
     <module>typespec-first</module>
     <!-- spec written in a custom SpecSketch DSL, translated to OpenAPI YAML by a single Java file -->
     <module>sketch-first</module>
+    <!-- spec derived from hand-written Java: a JAX-RS resource becomes SpecSketch + OpenAPI YAML -->
+    <module>code-first</module>
   </modules>
 
   <properties>
@@ -58,6 +60,12 @@
     <swagger-parser.version>2.1.28</swagger-parser.version>
     <snakeyaml.version>2.4</snakeyaml.version>
     <slf4j.version>2.0.17</slf4j.version>
+    <!--
+      code-first reads the OpenAPI annotations that Java signatures cannot express. These are the
+      standardized ones (MicroProfile OpenAPI, org.eclipse.microprofile.openapi.annotations),
+      not the Swagger vendor set - 3.1 is the release that belongs to Jakarta EE 10.
+    -->
+    <microprofile-openapi.version>3.1.1</microprofile-openapi.version>
   </properties>
 
   <dependencyManagement>
@@ -176,6 +184,15 @@
                 <configOptions>
                   <!-- THE switch for Jakarta EE 10: jakarta.validation / jakarta.ws.rs instead of javax.* -->
                   <useJakartaEe>true</useJakartaEe>
+                  <!--
+                    A discriminator is a declared property of the base AND openapi-generator emits
+                    @JsonTypeInfo(visible = true) for it, so Jackson would write it twice - once as
+                    the type id, once as the bean member, which is null unless the application
+                    assigns it. A consumer keeping the last occurrence of the duplicate key would
+                    read null and fail to resolve the subtype. NON_NULL drops the empty one, which
+                    makes the DTOs serialize correctly with a plain ObjectMapper.
+                  -->
+                  <additionalModelTypeAnnotations>@com.fasterxml.jackson.annotation.JsonInclude(com.fasterxml.jackson.annotation.JsonInclude.Include.NON_NULL)</additionalModelTypeAnnotations>
                   <dateLibrary>java8</dateLibrary>
                   <!-- keep DTOs dependency-light: no swagger/microprofile annotations -->
                   <useSwaggerAnnotations>false</useSwaggerAnnotations>

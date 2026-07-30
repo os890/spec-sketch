@@ -904,7 +904,7 @@ class SpecSketchGeneratorTest {
                 "response (1) : Res",
                 "    a (1) : Base",
                 "        extended by Sub",
-                "            x (1) : string"), "type 'Base' has no properties");
+                "            x (1) : string"), "requires the base type to define at least one property");
         // ... which also rules out a header-only request growing subtypes
         assertSpecFailure(() -> generate(
                 "request (1) : Req",
@@ -1120,10 +1120,25 @@ class SpecSketchGeneratorTest {
     }
 
     @Test
-    void typesWithoutPropertiesAreRejected() {
+    void headersMaySitOnALineThatOnlyReferencesATypeDefinedElsewhere() {
+        // '@' headers are not part of the schema, so such a line defines nothing and must not
+        // collide with the define-once rule - a response with headers may reuse a named type
+        String yaml = generate(
+                "Shipment (1) : Shipment",
+                "    trackingId (1) : uuid",
+                "response (0 - *) : Shipment",
+                "    @X-Total-Count (1) : int");
+
+        assertTrue(block(yaml, "headers", 10).contains("X-Total-Count:"));
+        assertTrue(schema(yaml, "Shipment").contains("trackingId"));
+        assertEquals(1, countOccurrences(yaml, "    Shipment:\n"));
+    }
+
+    @Test
+    void aReferenceOnlyResponseStillHasToResolve() {
         assertSpecFailure(() -> generate(
                 "response (1) : Res",
-                "    @X-Only (1) : string"), "has no properties");
+                "    @X-Only (1) : string"), "type 'Res' is used but never defined");
     }
 
     @Test

@@ -1030,16 +1030,25 @@ public final class SpecSketchGenerator {
     }
 
     private static void defineTypes(Node node, Registry registry, boolean isRequestRoot) {
-        if (node.children.isEmpty()) {
-            if (node.enumName != null) {
-                defineNamedEnum(node, registry);
-            } else if (node.enumValues == null
-                    && !node.type.equalsIgnoreCase("discriminator")
-                    && !BUILT_INS.containsKey(node.type.toLowerCase())) {
-                checkCaseCollision(node.type, node.lineNo, registry);
-                registry.references.putIfAbsent(node.type, node);
+        List<Node> subtypes = subtypeMarkers(node);
+        Map<String, Node> properties = node.children.isEmpty() ? Map.of() : declaredProperties(node);
+        // '@' headers are not part of the schema, so a line carrying only headers (or nothing at
+        // all) defines nothing - it is a plain reference and may point at a type defined elsewhere
+        if (properties.isEmpty() && subtypes.isEmpty()) {
+            boolean headerOnlyRequest = isRequestRoot && !node.children.isEmpty();
+            if (!headerOnlyRequest) {
+                registerLeaf(node, registry); // such a request has no body, so its type is unused
+            }
+            for (Node child : node.children) {
+                defineTypes(child, registry, false); // the header types still need defining
             }
             return;
+        }
+        if (properties.isEmpty()) {
+            // an object schema without properties is a free-form object for OpenAPI tooling: the
+            // model is dropped, so the subtypes would silently lose their base class
+            throw new SpecException("line " + subtypes.get(0).lineNo
+                    + ": 'extended by' requires the base type to define at least one property");
         }
         // these three name the indented line as well: the mistake is almost always there, not here
         if (node.enumValues != null) {
@@ -1067,26 +1076,6 @@ public final class SpecSketchGenerator {
                     + "' is already defined at line " + registry.definedAt.get(node.type)
                     + " - later occurrences must reference it by name, without nested properties");
         }
-        List<Node> subtypes = subtypeMarkers(node);
-        Map<String, Node> properties = declaredProperties(node);
-        if (properties.isEmpty()) {
-            // an object schema without properties means 'any object' in OpenAPI: the DTO generator
-            // drops the model, so references to it degrade to Object and subtypes lose their base
-            if (!isRequestRoot) {
-                throw new SpecException("line " + node.lineNo + ": type '" + node.type
-                        + "' has no properties - every type definition needs at least one property"
-                        + " (a property-less schema is a free-form object for OpenAPI tooling)");
-            }
-            if (!subtypes.isEmpty()) {
-                throw new SpecException("line " + subtypes.get(0).lineNo
-                        + ": 'extended by' requires the base type to define at least one property");
-            }
-            // a header-only request has no body, hence no schema - but its header types still count
-            for (Node child : node.children) {
-                defineTypes(child, registry, false);
-            }
-            return;
-        }
         Node discriminator = validateDiscriminator(node, subtypes);
         Map<String, Object> schema = objectSchema(node, registry.imports);
         if (discriminator != null) {
@@ -1100,6 +1089,18 @@ public final class SpecSketchGenerator {
             } else {
                 defineTypes(child, registry, false);
             }
+        }
+    }
+
+    /** A line that defines nothing: a built-in, a named enum, or a reference to a named type. */
+    private static void registerLeaf(Node node, Registry registry) {
+        if (node.enumName != null) {
+            defineNamedEnum(node, registry);
+        } else if (node.enumValues == null
+                && !node.type.equalsIgnoreCase("discriminator")
+                && !BUILT_INS.containsKey(node.type.toLowerCase())) {
+            checkCaseCollision(node.type, node.lineNo, registry);
+            registry.references.putIfAbsent(node.type, node);
         }
     }
 

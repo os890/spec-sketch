@@ -9,10 +9,13 @@ via `org.openapitools:openapi-generator-maven-plugin`, targeting **JAX-RS 3.1 / 
 | [`yaml-first/`](yaml-first/) | hand-written OpenAPI YAML (`src/main/openapi/petstore.yaml`) | JDK + Maven only |
 | [`typespec-first/`](typespec-first/) | [TypeSpec](https://typespec.io) (`src/main/typespec/main.tsp`), compiled to OpenAPI YAML during the build | additionally Node.js + pnpm |
 | [`sketch-first/`](sketch-first/) | custom **SpecSketch** DSL (`src/main/sketch/petstore.sketch`), translated to OpenAPI YAML by a single-file Java generator | JDK + Maven only |
+| [`code-first/`](code-first/) | **hand-written Java**: a JAX-RS resource plus its model, read by reflection and emitted as SpecSketch + OpenAPI YAML | JDK + Maven only |
 
 `yaml-first` and `typespec-first` describe the **same API** and end up with functionally
 identical generated DTOs (`Pet`, `NewPet`, `Category`, `PetStatus`, `ApiError`).
 `sketch-first` demonstrates a response-only API defined in a minimal custom format.
+`code-first` runs the other direction: the Java code is the source of truth and the spec is
+derived from it.
 
 ## Requirements
 
@@ -142,8 +145,25 @@ Rules:
   Marking one base property with the reserved type `discriminator` makes the hierarchy
   polymorphic: the property becomes a required string, the schema gets `discriminator` + a
   mapping of all transitive subtypes, and the generated Java carries
-  `@JsonTypeInfo`/`@JsonSubTypes` — so JSON deserializes into the concrete subtype. **The
-  discriminator is also what produces real Java inheritance** (`class Car extends Vehicle`):
+  `@JsonTypeInfo`/`@JsonSubTypes` — so JSON deserializes into the concrete subtype.
+
+  One subtlety on the **producing** side, handled by the shared generator config: the discriminator
+  is a declared, required property (that is what `discriminator.propertyName` expects) *and*
+  openapi-generator emits `@JsonTypeInfo(…, visible = true)` for it, so Jackson would write it
+  twice — once as the type id, once as the bean member, which is `null` unless the application
+  assigns it. A consumer keeping the last occurrence of the duplicate key would then read `null`
+  and fail to resolve the subtype. The DTOs are therefore generated with `@JsonInclude(NON_NULL)`
+  at class level (`additionalModelTypeAnnotations` in the parent pom), which drops the empty one:
+
+  ```
+  before:  {"eventType":"VaccinationEvent","vaccine":"rabies","eventType":null,"occurredAt":"…"}
+  now:     {"eventType":"VaccinationEvent","vaccine":"rabies","occurredAt":"…"}
+  ```
+
+  A plain `ObjectMapper` is enough, with nothing to configure at the call site;
+  `GeneratedDtoTest.aSubtypeMustNotSerializeTheDiscriminatorTwice` pins it down.
+
+  **The discriminator is also what produces real Java inheritance** (`class Car extends Vehicle`):
   without it the `allOf` composition is still valid OpenAPI, but openapi-generator flattens it
   into a standalone class that repeats the base properties instead of extending the base class.
   ```
@@ -284,6 +304,177 @@ generated DTO classes; that doesn't affect running the generator.
 A tour of **every** DSL feature in one definition lives in
 [`showcase.sketch`](sketch-first/src/main/sketch/showcase.sketch) (not wired into the
 build — run it through the generator as above to see the resulting OpenAPI document).
+
+### `code-first`
+
+The mirror image of `sketch-first`: instead of turning a sketch into a spec, `JavaSketchGenerator`
+turns compiled Java into the sketch and then hands it to `SpecSketchGenerator`, so both artifacts
+can never disagree and the yaml inherits every validation rule that lives there.
+
+```
+PetResource.java + model/*.java  --(reflection)-->  <endpoint>.sketch  --(SpecSketchGenerator)-->  <endpoint>.yaml
+```
+
+The entry point is a **JAX-RS resource class** — its endpoints already state which types go in and
+out. One `.sketch` + `.yaml` pair is written per endpoint method (the DSL describes one operation
+per file), side by side under `src/main/sketch/`, both under version control.
+
+- **Endpoints** — HTTP method from `@GET`/`@POST`/…, request body from the parameter that carries
+  no JAX-RS parameter annotation, response from the return type with `List`/`Set`/array unwrapped
+  into an array occurrence.
+- **A method returning `jakarta.ws.rs.core.Response`** hides its payload. The type is taken from
+  `@APIResponse(content = @Content(schema = @Schema(implementation = Pet.class)))`, and failing
+  that from an explicit mapping (`--response createPet=…`, or a properties file via
+  `--responses`). If neither resolves it, the endpoint is an **error** rather than a silently
+  empty response. All three routes are live in `PetResource`: `listPets` declares it in the
+  signature, `getPet` via `@APIResponse`, `createPet` via the pom's `--response` argument.
+
+  The annotations read here are the **standardized** ones —
+  [MicroProfile OpenAPI](https://github.com/eclipse/microprofile-open-api)
+  (`org.eclipse.microprofile.openapi.annotations.*`, the 3.1 release that belongs to Jakarta
+  EE 10) — not the Swagger vendor set. They are `provided` scope, and the generator reads all
+  annotations by name, so a model that uses only some of them still works.
+- **Cycles** — `Pet → Owner → Pet` (and `Category → Category`) terminate by referencing the type
+  by name instead of nesting it again, and the closing member is forced to be **optional**: at
+  runtime that second instance is built differently, its back reference stays null and
+  `@JsonInclude` drops it, so the payload has no such member at all. Requiring it would describe a
+  document that is never sent. Even a `@NotNull` back reference is emitted as `(0 - 1)`, and the
+  generator says so.
+- **Layout** — every type is defined at its **first usage**, so the request/response part carries
+  the structural tree and it mirrors the *declared* types of the properties. A property declared as
+  a base shows that base's own properties and subtree; what a subtype adds — including a subtree of
+  its own — appears at that subtype's `extended by` block, not in the overall tree. Declaring the
+  concrete type instead of the base therefore shows the subtype's additions in the tree as well.
+
+  ```
+  response (1) : OrderReport
+      order (1) : Order
+          customer (1) : Customer
+              contact (1) : Contact
+                  address (0 - 1) : Address        # the tree, top-down
+          lines (1 - *) : OrderLine
+              product (1) : Product                # declared as the base ...
+                  productType (1) : discriminator  # ... so the base's own structure shows here
+                  sku (1) : string {minLength: 3, maxLength: 20}
+                  price (1) : Money
+                      amount (1) : BigDecimal
+                  extended by PhysicalProduct      # what each subtype adds, and only that
+                      dimensions (0 - 1) : Dimensions
+                          width (1) : double
+                  extended by DigitalProduct
+                      license (0 - 1) : License
+                          key (1) : string
+                  extended by BundleProduct
+                      items (0 - *) : Product      # cycle: referenced by name
+  ```
+
+  A type used twice is defined at the first usage and referenced by name afterwards, so
+  `components.schemas` holds exactly one of each. The one construct that cannot be inlined is a
+  property declared as a **subtype**: `extended by` has to sit inside its base, and a line whose
+  type is `ExpressParcel` cannot host `Shipment`'s definition. Such a hierarchy follows the parts
+  as a stand-alone block instead (`Shipment (1) : Shipment`, the DSL's form for a reusable type).
+- **Two kinds of base class** — a class with subtypes is only a *hierarchy* if a payload can
+  actually arrive as one of them: either the class says so (`@JsonTypeInfo`, `@JsonSubTypes`,
+  `sealed`) or it is used in a payload slot, so whatever fills that slot may be any subtype.
+
+  A common base such as `BaseDTO` with `validFrom`/`validTo` is the other kind: it has subtypes,
+  but nothing is ever typed as `BaseDTO` — only the concrete DTOs are, and they are never
+  interchangeable. Treating it as a discriminated union would collapse the whole model into one
+  list of siblings beneath it and leave the response part a single line, so its members are
+  **flattened into each subtype** instead. Without a discriminator openapi-generator flattens such
+  an `allOf` anyway, so this yields the same generated DTOs with a document that still shows the
+  tree:
+
+  ```
+  response (1) : OrderReport
+      validFrom (1) : LocalDate          # from BaseDTO
+      validTo (0 - 1) : LocalDate
+      order (1) : Order
+          validFrom (1) : LocalDate
+          validTo (0 - 1) : LocalDate
+          orderId (1) : long
+          product (1) : Product          # a real hierarchy below a shared base
+              productType (1) : discriminator
+              validFrom (1) : LocalDate  # the shared members sit on the base of the hierarchy ...
+              validTo (0 - 1) : LocalDate
+              sku (1) : string
+              extended by PhysicalProduct
+                  weightKg (1) : double  # ... so a subtype adds only what is its own
+  ```
+- **Class hierarchies** — a type with subtypes, or one extending another model type, becomes one
+  top-level definition: base properties, then an `extended by` block per subtype, recursively
+  (`Shipment → ParcelShipment → ExpressParcel` is three deep). The property named by
+  `@JsonTypeInfo` becomes the DSL's `discriminator` — which is also what makes the DTO generator
+  emit real Java inheritance. Each level contributes only its own declared fields, and the
+  discriminator is emitted once, at the level that declares it.
+
+  Reflection cannot enumerate the subclasses of a class, so subtypes come from a **declaration**
+  where there is one, and otherwise from **scanning the base's own package**:
+
+  | Source | Example | Reported? |
+  |---|---|---|
+  | `@JsonSubTypes` on the base — authoritative, since it is the list Jackson deserializes into | `@JsonSubTypes(@Type(value = Car.class, name = "Car"))` | no |
+  | a **sealed** type — the `permits` clause is in the class file, no annotation needed | `sealed class Shape permits Circle, Square` | no |
+  | `--subtypes`, for a model that carries neither | `--subtypes Animal=com.acme.Dog,com.acme.Cat` | no |
+  | a package scan, as the default | `class Dog extends Animal` next to `Animal` | **yes** |
+
+  So plain `class Dog extends Animal` works out of the box. The scan covers the base's own package
+  **plus the packages of the request and response types** — a base regularly comes from a shared
+  library while the concrete subtypes sit next to the DTO that uses them, and scanning only the
+  base's package would find nothing there:
+
+  ```
+  shared lib:  com.acme.shared.Event          (abstract base, knows no subtypes)
+  application: com.acme.petstore.EventFeed    (response DTO)
+               com.acme.petstore.PetEvent     (extends Event)   ← found via the DTO's package
+  ```
+
+  Since scanning is a guess, it says so, and names every package it looked at:
+
+  ```
+  warning: nothing declares the subtypes of Event, so the scan covered packages
+  [com.acme.shared, com.acme.petstore] and found [PetEvent] - a subtype outside stays invisible;
+  declare them with @JsonSubTypes, make Event sealed, or pass --subtypes Event=<class>[,<class>]
+  ```
+
+  Both exploded class directories (`target/classes`, `target/test-classes`) and jars are walked, so
+  a package split across roots — base in a dependency jar, subtype added in a test — resolves.
+  Several classloaders are consulted, since those roots are not always visible to the same one.
+  Scanned subtypes are sorted by class name, so the emitted sketch does not depend on file system
+  order; classes are loaded without initialization and anything unloadable is skipped.
+
+  If a type says it is polymorphic — it declares `@JsonTypeInfo`, is `sealed`, or is `abstract` —
+  and *nothing* is found, declared or in its package, that is an **error** rather than a document
+  containing only the base.
+- **Members** — declared, non-static, non-transient fields, honouring `@JsonIgnore` and
+  `@JsonProperty`. A field is required when it is a primitive, `@NotNull`/`@NotEmpty`/`@NotBlank`,
+  or marked required via `@Schema`/`@JsonProperty`; everything else may be absent, which is what a
+  nullable Java reference plus `@JsonInclude(NON_NULL)` actually means on the wire.
+- **Constraints** — `@Size`/`@Pattern`/`@Min`/`@Max`/`@DecimalMin`/`@DecimalMax` become the DSL's
+  `{…}` attribute block; on a collection `@Size` becomes the occurrence instead. `@Size`/`@Pattern`
+  on a `LocalDate` or `UUID` is dropped **and reported**, because the resulting `@Size`/`@Pattern`
+  could not be validated at runtime (see the same rule in `sketch-first`).
+- **Headers** — `@HeaderParam` parameters (and `@Parameter(in = ParameterIn.HEADER)`) become
+  request header lines, `@APIResponse(headers = @Header(…))` become response header lines. A
+  header is required when `@NotNull`, `@Parameter(required = true)` or `@Header(required = true)`
+  says so.
+- **Everything the DSL cannot express yet is reported, never dropped silently**: path and query
+  parameters, non-200 responses, `Map` and `byte[]` members, and the fact that the yaml path is
+  derived from the file name rather than from `@Path`.
+
+Run it standalone against any resource class:
+
+```bash
+java -cp "code-first/target/classes:$(cat cp.txt)" JavaSketchGenerator \
+  org.os890.sketch.petstore.PetResource ./out \
+  --response createPet=org.os890.sketch.petstore.model.Pet
+```
+
+`code-first` deliberately stops at the spec: it already has the Java classes, so generating DTOs
+from its own output would be circular. [`JavaSketchGeneratorTest`](code-first/src/test/java/JavaSketchGeneratorTest.java)
+covers each case above, and every sketch it produces is run through `SpecSketchGenerator` plus
+swagger-parser and SnakeYAML — so a test can only pass if the emitted sketch is valid DSL input
+*and* the resulting document is one the OpenAPI toolchain accepts.
 
 ### Usage demo
 

@@ -83,7 +83,8 @@ class GeneratedDtoTest {
 
     @Test
     void polymorphicSubtypesSurviveJsonRoundTrip() throws Exception {
-        // the application assembles the real result from subtypes...
+        // the application assembles the real result from subtypes; setting the discriminator
+        // explicitly matters - see aSubtypeMustNotSerializeTheDiscriminatorTwice below
         VaccinationEvent vaccination = new VaccinationEvent();
         vaccination.setEventType("VaccinationEvent");
         vaccination.setOccurredAt(OffsetDateTime.parse("2026-07-01T09:00:00Z"));
@@ -106,6 +107,33 @@ class GeneratedDtoTest {
         assertEquals("rabies", parsedVaccination.getVaccine());
         AdoptionEvent parsedAdoption = assertInstanceOf(AdoptionEvent.class, events.get(1));
         assertEquals("Alice", parsedAdoption.getNewOwner());
+    }
+
+    @Test
+    void aSubtypeMustNotSerializeTheDiscriminatorTwice() throws Exception {
+        /*
+         * The discriminator is a declared, required property of the base - that is what the OpenAPI
+         * spec expects of discriminator.propertyName - and openapi-generator additionally emits
+         * @JsonTypeInfo(..., visible = true) for it. Jackson therefore writes it twice: once as the
+         * type id, once as the bean member, which is null unless the application assigns it. A
+         * consumer that keeps the LAST occurrence of a duplicate key then reads null and cannot
+         * resolve the subtype at all.
+         *
+         * The DTOs are therefore generated with @JsonInclude(NON_NULL) at class level (see
+         * additionalModelTypeAnnotations in the parent pom), which drops the empty one and leaves
+         * the type id alone - so a PLAIN ObjectMapper is enough, with nothing to configure here.
+         */
+        VaccinationEvent vaccination = new VaccinationEvent();
+        vaccination.setOccurredAt(OffsetDateTime.parse("2026-07-01T09:00:00Z"));
+        vaccination.setVaccine("rabies");
+
+        String json = mapper.writeValueAsString(vaccination);
+
+        assertEquals(1, json.split("\"eventType\"", -1).length - 1,
+                () -> "the discriminator has to appear exactly once: " + json);
+        assertEquals("VaccinationEvent", mapper.readTree(json).get("eventType").asText(), json);
+        // and it still resolves the concrete type when read back through the base
+        assertInstanceOf(VaccinationEvent.class, mapper.readValue(json, PetEvent.class));
     }
 
     @Test

@@ -1,0 +1,69 @@
+openapi: 3.0.3
+info:
+  title: 'listShipments API (generated from SpecSketch)'
+  version: 1.0.0
+paths:
+  '/listShipments':
+    get:
+      operationId: getShipment
+      responses:
+        '200':
+          description: 'Generated from SpecSketch definition ''response'''
+          headers:
+            X-Total-Count:
+              schema:
+                type: integer
+                format: int32
+          content:
+            'application/json':
+              schema:
+                type: array
+                items:
+                  '$ref': '#/components/schemas/Shipment'
+components:
+  schemas:
+    Shipment:
+      type: object
+      required:
+        - shipmentType
+        - trackingId
+      properties:
+        shipmentType:
+          type: string
+        trackingId:
+          type: string
+          format: uuid
+      discriminator:
+        propertyName: shipmentType
+        mapping:
+          ParcelShipment: '#/components/schemas/ParcelShipment'
+          ExpressParcel: '#/components/schemas/ExpressParcel'
+          PickupShipment: '#/components/schemas/PickupShipment'
+    ParcelShipment:
+      allOf:
+        - '$ref': '#/components/schemas/Shipment'
+        - type: object
+          required:
+            - weightKg
+          properties:
+            weightKg:
+              type: number
+              format: double
+    ExpressParcel:
+      allOf:
+        - '$ref': '#/components/schemas/ParcelShipment'
+        - type: object
+          properties:
+            guaranteedBy:
+              type: string
+              format: date-time
+    PickupShipment:
+      allOf:
+        - '$ref': '#/components/schemas/Shipment'
+        - type: object
+          required:
+            - storeId
+          properties:
+            storeId:
+              type: integer
+              format: int64
