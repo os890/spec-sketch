@@ -116,6 +116,27 @@ Everything below is a consequence of the DSL gaps above: the Java model states i
   Scanning the whole classpath would find it, at the cost of walking every jar on
   every run.
 
+## sketch-first: the class diagrams (SpecSketch -> Mermaid / PlantUML)
+
+- [ ] **The diagrams are not wired into the build** — both generators are standalone
+  tools (each with its own runnable jar); the demo's diagram is embedded in the
+  README instead. Generating `<sketch>.mmd`/`.puml` during the build means deciding
+  whether a diagram is a versioned artifact like the yaml — the RAT excludes for
+  `**/*.mmd` and `**/*.puml` are already there, so the only open question is whether
+  they belong in git.
+- [ ] **Validation attributes are not drawn** — a UML constraint block would be the
+  place for `{minLength: 1}`, but neither language lets a class body carry braces,
+  so every constrained property would need its own note. Left out for now.
+- [ ] **The operation itself is not drawn** — HTTP method, path template, status
+  code and content type have no place in a class diagram; if they are wanted, they
+  need a second view (a note block, or another diagram type) rather than more boxes
+  in this one.
+- [ ] **A third language would be a third emitter** — `SketchDiagram` holds the model
+  and both generators only spell it out, so Graphviz/D2/mermaid-ER would be one file
+  of formatting plus one jar execution. What is not covered by the shared model are
+  languages that need a different *kind* of picture (a sequence or state diagram),
+  which would need their own walk over the sketch.
+
 ## Tooling / polish
 
 

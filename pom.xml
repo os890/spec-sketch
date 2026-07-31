@@ -151,6 +151,9 @@
             <exclude>**/tsp-output/**</exclude>
             <!-- files that cannot or should not carry a header -->
             <exclude>**/*.md</exclude>
+            <!-- diagrams: a generated view of a sketch, written next to it by the diagram generators -->
+            <exclude>**/*.mmd</exclude>
+            <exclude>**/*.puml</exclude>
             <exclude>**/.gitignore</exclude>
             <exclude>**/package.json</exclude>
             <exclude>**/pnpm-lock.yaml</exclude>

@@ -172,6 +172,9 @@ import java.util.regex.Pattern;
  *        (No build step needed thanks to the JDK source launcher; a plain
  *        'javac SpecSketchGenerator.java' works as well since there are no
  *        dependencies outside the JDK.)
+ *
+ * The same sketch has a second reader: SketchMermaidGenerator, next to this file, draws it as a
+ * Mermaid class diagram - it reuses the parser below instead of reading the DSL itself.
  */
 public final class SpecSketchGenerator {
 
@@ -243,7 +246,7 @@ public final class SpecSketchGenerator {
      * value for that, so it is resolved to QUERY (and reported) before anything is emitted - which
      * is why {@link #wireName()} is never called on it.
      */
-    private enum ParamIn {
+    enum ParamIn {
         PATH, QUERY, HEADER, COOKIE, UNSPECIFIED;
 
         /** The OpenAPI 'in' value. */
@@ -262,7 +265,12 @@ public final class SpecSketchGenerator {
         }
     }
 
-    private static final class Node {
+    /**
+     * One parsed line with the lines nested below it. Package-visible together with {@link #parse}
+     * and {@link ParamIn}, so a second tool in this package can render the very tree this
+     * translation walks instead of parsing the DSL a second time (SketchMermaidGenerator does).
+     */
+    static final class Node {
         final int lineNo;
         final String name;
         final ParamIn location;        // null -> a body property; otherwise the parameter sigil
@@ -555,7 +563,7 @@ public final class SpecSketchGenerator {
 
     // ---------------------------------------------------------------- parsing
 
-    private static List<Node> parse(List<String> lines) {
+    static List<Node> parse(List<String> lines) {
         List<Node> roots = new ArrayList<>();
         List<Node> stack = new ArrayList<>(); // stack.get(i) = currently open node at depth i
         for (int i = 0; i < lines.size(); i++) {

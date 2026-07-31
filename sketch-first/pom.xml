@@ -27,7 +27,7 @@
   <packaging>jar</packaging>
 
   <name>sketch-first</name>
-  <description>DTO generation from a custom SpecSketch DSL, translated to OpenAPI YAML by a single-file Java generator</description>
+  <description>DTO generation from a custom SpecSketch DSL, translated to OpenAPI YAML by a single-file Java generator (plus a second one rendering the same sketch as a Mermaid class diagram)</description>
 
   <dependencies>
     <!--
@@ -86,9 +86,12 @@
         </executions>
       </plugin>
       <!--
-        Compile the single-file generator into the module: src/main/tools is added as a
-        source root, so SpecSketchGeneratorTest can call it AND the generator ships in the
-        module's jar, which is made runnable below (java -jar target/sketch-first-*.jar).
+        Compile the generators into the module: src/main/tools is added as a source root, so the
+        tests can call them AND they ship in the module's jar, which is made runnable below
+        (java -jar target/sketch-first-*.jar). They all live in the default package next to
+        SpecSketchGenerator, because none of them reads the DSL a second time: the two diagram
+        generators render the node tree that parser produces, through the model in SketchDiagram
+        that both of them share.
       -->
       <plugin>
         <groupId>org.codehaus.mojo</groupId>
@@ -121,6 +124,44 @@
             </manifest>
           </archive>
         </configuration>
+        <executions>
+          <!--
+            The same classes once more per diagram generator: a jar has exactly one entry point, so
+            each of them gets its own classified artifact
+            (java -jar target/sketch-first-*-mermaid.jar <input.sketch>). All three jars hold all
+            three generators - only the manifest differs.
+          -->
+          <execution>
+            <id>mermaid-jar</id>
+            <phase>package</phase>
+            <goals>
+              <goal>jar</goal>
+            </goals>
+            <configuration>
+              <classifier>mermaid</classifier>
+              <archive>
+                <manifest>
+                  <mainClass>SketchMermaidGenerator</mainClass>
+                </manifest>
+              </archive>
+            </configuration>
+          </execution>
+          <execution>
+            <id>plantuml-jar</id>
+            <phase>package</phase>
+            <goals>
+              <goal>jar</goal>
+            </goals>
+            <configuration>
+              <classifier>plantuml</classifier>
+              <archive>
+                <manifest>
+                  <mainClass>SketchPlantUmlGenerator</mainClass>
+                </manifest>
+              </archive>
+            </configuration>
+          </execution>
+        </executions>
       </plugin>
       <!-- Step 2: same DTO generation as in the other modules, only the inputSpec differs -->
       <plugin>

@@ -15,7 +15,9 @@ via `org.openapitools:openapi-generator-maven-plugin`, targeting **JAX-RS 3.1 / 
 identical generated DTOs (`Pet`, `NewPet`, `Category`, `PetStatus`, `ApiError`).
 `sketch-first` demonstrates a response-only API defined in a minimal custom format.
 `code-first` runs the other direction: the Java code is the source of truth and the spec is
-derived from it.
+derived from it. A sketch also has readers besides the OpenAPI translation: it is
+[drawn as a class diagram](#the-same-sketch-as-a-diagram-mermaid-and-plantuml), in Mermaid or in
+PlantUML.
 
 ## Requirements
 
@@ -265,8 +267,8 @@ reader, which must see string keys only (unquoted `on`, `yes` or `null` would ot
 a property name into a boolean or null). Both are test-scoped: the generator itself stays
 dependency-free. External `$ref`s are not resolved, because an `import` without a known path
 deliberately emits a `TODO-IMPORT` placeholder pointing at a file that does not exist yet.
-The generator is compiled into the module's *test* sources via the
-`build-helper-maven-plugin`, so it stays out of the produced jar.
+`src/main/tools` is added as a source root via the `build-helper-maven-plugin`, so the tests can
+call the generator and it ships in the module jar, whose `Main-Class` makes that jar runnable.
 
 The Maven build chains two steps in the `generate-sources` phase:
 
@@ -328,6 +330,474 @@ generated DTO classes; that doesn't affect running the generator.
 A tour of **every** DSL feature in one definition lives in
 [`showcase.sketch`](sketch-first/src/main/sketch/showcase.sketch) (not wired into the
 build — run it through the generator as above to see the resulting OpenAPI document).
+
+#### The same sketch as a diagram: Mermaid and PlantUML
+
+A sketch describes a model, and a model reads better as a picture than as either of its text forms.
+Two generators draw it — [`SketchMermaidGenerator`](sketch-first/src/main/tools/SketchMermaidGenerator.java)
+as a [Mermaid](https://mermaid.js.org/) class diagram, and
+[`SketchPlantUmlGenerator`](sketch-first/src/main/tools/SketchPlantUmlGenerator.java) as a
+[PlantUML](https://plantuml.com/class-diagram) one — and neither of them reads the DSL a second time:
+both call `SpecSketchGenerator`, translate the sketch to YAML, throw that result away and draw the
+very node tree the translation walks. So the picture can never disagree with the document, and a
+sketch that would not produce a valid OpenAPI document produces no diagram either — it fails with the
+same message and the same line number.
+
+What a diagram contains is decided **once**, in
+[`SketchDiagram`](sketch-first/src/main/tools/SketchDiagram.java): boxes with members, inheritance
+arrows and labelled associations, in a form no diagram language has yet. That is where all the
+thinking sits; spelling it out in mermaid or in PlantUML is a formatting question, and one nobody
+should have to answer twice. A rule added there reaches both languages, and neither can drift away
+from the other.
+
+| in the sketch | in the diagram |
+| --- | --- |
+| a type with properties | a box, in declaration order |
+| the `request` / `response` part | that box, marked `<<request>>` / `<<response>>` |
+| a property of a built-in type | a member, spelled as the sketch spells it: `+long id`, `+Instant createdAt` |
+| an occurrence other than `(1)` | a UML multiplicity: `+string tags [0..*]`, `[0..1]`, `[1..*]`, `[2]`, `[0..3]` |
+| a property of a named type | an association carrying that multiplicity: `PetPageResponse --> "0..*" Pet : pets` |
+| a self-reference | the association it is: `Category --> "0..*" Category : children` |
+| a parameter or header | a member keeping its sigil: `@X-Request-Id`, `?status`, `$cookie:session`, `$petId` when the location is still undecided — and `$path:petId` for `{petId}`, since braces would end the class body both languages write in braces |
+| `extended by <SubType>` | `Base <\|-- Sub`, the subtype box holding only the properties it adds (the `allOf` composition) |
+| a `discriminator` property | a member that keeps the reserved type as its type: `+discriminator eventType` |
+| a named enum | one enum box every usage links to (`<<enumeration>>` in mermaid, which has no enum form of its own; `enum` in PlantUML) |
+| an inline enum | an enum box named `<OwnerType><Property>Enum` — the inner enum openapi-generator derives from it |
+| `enum:int`, `enum:long`, … | a note on that box (`values of type int`): `enum [1, 2]` and `enum:int [1, 2]` list the same values but are different enums |
+| `import <Type>` | an `<<external>>` box with a note naming the file its details live in |
+
+Left out on purpose is everything that describes the wire format rather than the model: validation
+attributes (`{minLength: 1}`), the OpenAPI type and format behind each built-in, the HTTP method,
+the derived path template and the content type. Those live in the generated YAML; a class diagram
+repeating them would be unreadable without being any more complete. Two corner cases have their own
+answer: a part that declares its payload instead of naming a type gets a box named after the part
+(`response (1) : string` draws a `<<response>>` box `response` holding `+string body`), and a request
+of parameters alone draws just those — it has no body in the YAML either.
+
+Usage mirrors `SpecSketchGenerator`, with `.mmd` / `.puml` instead of `.yaml` — the suffixes the two
+toolchains read — and with the same reconciliation: an existing diagram that differs is overwritten,
+but the overwrite is reported instead of silently discarding a hand edit. A jar has one `Main-Class`,
+so each generator gets its own classified artifact; all three jars contain all three generators, only
+the manifest differs.
+
+```bash
+java -jar sketch-first/target/sketch-first-1.0.0-SNAPSHOT-mermaid.jar  my-api.sketch  # -> my-api.mmd next to it
+java -jar sketch-first/target/sketch-first-1.0.0-SNAPSHOT-plantuml.jar my-api.sketch  # -> my-api.puml next to it
+java -jar …-mermaid.jar my-api.sketch docs/api.mmd    # explicit output path
+java -jar …-mermaid.jar my-api.sketch -               # print to stdout
+java -jar …-mermaid.jar my-api.sketch --structure     # -> my-api-structure.mmd (see below)
+
+# without the jar: a diagram generator needs SpecSketchGenerator and SketchDiagram, so the
+# single-file source launcher only works on JDK 22+, which compiles the siblings from the same folder
+java sketch-first/src/main/tools/SketchPlantUmlGenerator.java sketch-first/src/main/sketch/petstore.sketch -
+
+# on JDK 17-21 compile the tools once
+javac -d out sketch-first/src/main/tools/*.java && java -cp out SketchPlantUmlGenerator my-api.sketch
+```
+
+Both suffixes belong next to the sketch and its yaml, like any other result — the license check skips
+them, since a generated diagram carries no header. Rendering is up to the consumer: GitHub, GitLab,
+the IDE plugins and the two command-line tools all read the files as they are written. To get images
+without installing anything, the official containers render into an unversioned folder:
+
+```bash
+mkdir -p sketch-first/target/diagrams
+java -jar sketch-first/target/sketch-first-1.0.0-SNAPSHOT-mermaid.jar \
+    sketch-first/src/main/sketch/showcase.sketch sketch-first/target/diagrams/showcase.mmd
+java -jar sketch-first/target/sketch-first-1.0.0-SNAPSHOT-plantuml.jar \
+    sketch-first/src/main/sketch/showcase.sketch sketch-first/target/diagrams/showcase.puml
+
+podman run --rm -v "$PWD":/data ghcr.io/mermaid-js/mermaid-cli/mermaid-cli:latest \
+    -i sketch-first/target/diagrams/showcase.mmd -o sketch-first/target/diagrams/showcase.png -s 2
+podman run --rm -v "$PWD":/data docker.io/plantuml/plantuml:latest \
+    -tpng "/data/sketch-first/target/diagrams/showcase.puml"
+```
+
+The diagrams below are the mermaid output, because GitHub renders it in place; the PlantUML files
+state the same boxes and arrows, with the stereotype on the declaration
+(`class Pet <<response>>`), PlantUML's own `enum` form, and each note attached below its box.
+
+This is [`petstore.sketch`](sketch-first/src/main/sketch/petstore.sketch), rendered by GitHub from
+the generator's own output:
+
+```mermaid
+classDiagram
+    %% generated from petstore.sketch by SketchMermaidGenerator - change the sketch, not this file
+
+    class Money {
+        <<external>>
+    }
+
+    class CreatePetRequest {
+        <<request>>
+        +uuid @X-Request-Id [0..1]
+        +string name
+        +string tags [0..*]
+    }
+
+    class PetStatus {
+        <<enumeration>>
+        AVAILABLE
+        PENDING
+        SOLD
+    }
+
+    class PetPageResponse {
+        <<response>>
+        +int totalCount
+    }
+
+    class Pet {
+        +long id
+        +string name
+        +string tags [0..*]
+        +Instant createdAt [0..1]
+        +LocalDate birthday [0..1]
+    }
+
+    class Category {
+        +long id
+        +string name
+    }
+
+    class Owner {
+        +string name
+    }
+
+    class Contact {
+        +string email
+        +string phone [0..1]
+    }
+
+    class PetEvent {
+        +discriminator eventType
+        +Instant occurredAt
+    }
+
+    class VaccinationEvent {
+        +string vaccine
+    }
+
+    class AdoptionEvent {
+        +string newOwner
+    }
+
+    PetEvent <|-- VaccinationEvent
+    PetEvent <|-- AdoptionEvent
+
+    CreatePetRequest --> "0..1" PetStatus : status
+    CreatePetRequest --> "0..1" Category : category
+    PetPageResponse --> "0..*" Pet : pets
+    Pet --> "1" PetStatus : status
+    Pet --> "0..1" Category : category
+    Pet --> "0..1" Money : price
+    PetPageResponse --> "0..1" Owner : owner
+    Owner --> "1" Contact : contact
+    PetPageResponse --> "0..1" Pet : favorite
+    PetPageResponse --> "0..*" PetEvent : events
+
+    note for Money "imported from common-types.yaml"
+```
+
+And this is [`showcase.sketch`](sketch-first/src/main/sketch/showcase.sketch), the tour of **every**
+DSL feature: 20 classes with every field they carry, the nested polymorphic `Shipment` hierarchy,
+both kinds of enum, an `import` whose path is not filled in yet, and each parameter sigil. It is also
+the honest argument for the option below — at this size the fields take most of the space:
+
+```mermaid
+classDiagram
+    %% generated from showcase.sketch by SketchMermaidGenerator - change the sketch, not this file
+
+    class Money {
+        <<external>>
+    }
+
+    class PlaceOrderRequest {
+        <<request>>
+        +uuid @X-Client-Id
+        +string @X-Feature-Flags [0..*]
+        +string @Accept-Language [0..1]
+        +uuid $path:customerId
+        +boolean ?dryRun [0..1]
+        +uuid $cookie:session [0..1]
+        +string $couponSource [0..1]
+        +uuid customerId
+        +string voucherCode [0..1]
+        +string couponCodes [0..3]
+        +datetime deliveryWindow [2]
+    }
+
+    class PlaceOrderRequestChannelEnum {
+        <<enumeration>>
+        WEB
+        APP
+    }
+
+    class OrderItem {
+        +long petId
+        +int quantity
+        +float weightKg [0..1]
+        +string notes [0..1]
+    }
+
+    class Payment {
+        +String cardNumber [0..1]
+    }
+
+    class PaymentMethodEnum {
+        <<enumeration>>
+        CARD
+        PAYPAL
+        INVOICE
+    }
+
+    class OrderConfirmation {
+        <<response>>
+        +int @X-Rate-Limit-Remaining
+        +uuid orderId
+        +Instant placedAt
+        +LocalDate deliveryDate [0..1]
+    }
+
+    class OrderStatus {
+        <<enumeration>>
+        PLACED
+        PAID
+        SHIPPED
+        DELIVERED
+    }
+
+    class Stars {
+        <<enumeration>>
+        1
+        2
+        3
+        4
+        5
+    }
+
+    class Address {
+        +string street
+        +string zip
+        +string city
+    }
+
+    class AddressCountryEnum {
+        <<enumeration>>
+        AT
+        DE
+        CH
+    }
+
+    class Invoice {
+        +string number
+        +BigDecimal gross
+        +double vatRate
+        +boolean paid
+        +char currency
+    }
+
+    class InvoicePosition {
+        +string description
+        +BigDecimal amount
+    }
+
+    class Discount {
+        +double percent
+        +string reason [0..1]
+    }
+
+    class StatusChange {
+        +datetime changedAt
+    }
+
+    class Category {
+        +long id
+        +string name
+    }
+
+    class Shipment {
+        +discriminator shipmentType
+        +uuid trackingId
+    }
+
+    class ParcelShipment {
+        +double weightKg
+    }
+
+    class ExpressParcel {
+        +Instant guaranteedBy
+    }
+
+    class PickupShipment {
+        +long storeId
+    }
+
+    Shipment <|-- ParcelShipment
+    ParcelShipment <|-- ExpressParcel
+    Shipment <|-- PickupShipment
+
+    PlaceOrderRequest --> "0..*" PlaceOrderRequestChannelEnum : ?channel
+    PlaceOrderRequest --> "1" Address : shippingAddress
+    PlaceOrderRequest --> "1..*" OrderItem : items
+    PlaceOrderRequest --> "1" Payment : payment
+    Payment --> "1" PaymentMethodEnum : method
+    OrderConfirmation --> "0..1" OrderStatus : @X-Order-Status
+    OrderConfirmation --> "1" OrderStatus : status
+    OrderConfirmation --> "0..1" Stars : rating
+    OrderConfirmation --> "0..1" Address : deliveryAddress
+    Address --> "0..1" AddressCountryEnum : country
+    OrderConfirmation --> "0..1" Invoice : invoice
+    Invoice --> "1" Money : total
+    Invoice --> "1..*" InvoicePosition : positions
+    InvoicePosition --> "0..1" Discount : discount
+    OrderConfirmation --> "0..*" StatusChange : history
+    StatusChange --> "0..1" OrderStatus : from
+    StatusChange --> "1" OrderStatus : to
+    OrderConfirmation --> "0..*" Category : relatedCategories
+    Category --> "0..*" Category : children
+    OrderConfirmation --> "0..*" Shipment : shipments
+
+    note for Money "imported - no path in the sketch yet"
+    note for Stars "values of type int"
+```
+
+##### `--structure`: the type graph without the detail
+
+The full view answers *what does this payload look like*. On a model of any size the more common
+question is *which types are there and how do they relate*, and the answer is in the boxes and
+arrows alone — the strings and numbers only make it harder to see. `--structure` drops every
+attribute of a built-in type (parameters and headers included) and keeps the rest: classes, enums,
+imports, associations with their multiplicities, and inheritance. Two things stay although they are
+not classes, because they say what a type **is** rather than what it holds — the values of an enum,
+and the `discriminator`, which is what makes the hierarchy below it polymorphic.
+
+Both generators take the option, and in both the two views get two default file names
+(`my-api.mmd` / `my-api-structure.mmd`, `my-api.puml` / `my-api-structure.puml`), so asking for one
+never overwrites the other; the structure view carries a second header comment stating that fields
+are missing on purpose. This is the showcase above once more, as its type graph alone — same 20
+classes, same arrows, 106 lines instead of 155:
+
+```mermaid
+classDiagram
+    %% generated from showcase.sketch by SketchMermaidGenerator - change the sketch, not this file
+    %% structure view: the custom types and how they relate; attributes of a built-in type are left out
+
+    class Money {
+        <<external>>
+    }
+
+    class PlaceOrderRequest {
+        <<request>>
+    }
+
+    class PlaceOrderRequestChannelEnum {
+        <<enumeration>>
+        WEB
+        APP
+    }
+
+    class OrderItem
+
+    class Payment
+
+    class PaymentMethodEnum {
+        <<enumeration>>
+        CARD
+        PAYPAL
+        INVOICE
+    }
+
+    class OrderConfirmation {
+        <<response>>
+    }
+
+    class OrderStatus {
+        <<enumeration>>
+        PLACED
+        PAID
+        SHIPPED
+        DELIVERED
+    }
+
+    class Stars {
+        <<enumeration>>
+        1
+        2
+        3
+        4
+        5
+    }
+
+    class Address
+
+    class AddressCountryEnum {
+        <<enumeration>>
+        AT
+        DE
+        CH
+    }
+
+    class Invoice
+
+    class InvoicePosition
+
+    class Discount
+
+    class StatusChange
+
+    class Category
+
+    class Shipment {
+        +discriminator shipmentType
+    }
+
+    class ParcelShipment
+
+    class ExpressParcel
+
+    class PickupShipment
+
+    Shipment <|-- ParcelShipment
+    ParcelShipment <|-- ExpressParcel
+    Shipment <|-- PickupShipment
+
+    PlaceOrderRequest --> "0..*" PlaceOrderRequestChannelEnum : ?channel
+    PlaceOrderRequest --> "1" Address : shippingAddress
+    PlaceOrderRequest --> "1..*" OrderItem : items
+    PlaceOrderRequest --> "1" Payment : payment
+    Payment --> "1" PaymentMethodEnum : method
+    OrderConfirmation --> "0..1" OrderStatus : @X-Order-Status
+    OrderConfirmation --> "1" OrderStatus : status
+    OrderConfirmation --> "0..1" Stars : rating
+    OrderConfirmation --> "0..1" Address : deliveryAddress
+    Address --> "0..1" AddressCountryEnum : country
+    OrderConfirmation --> "0..1" Invoice : invoice
+    Invoice --> "1" Money : total
+    Invoice --> "1..*" InvoicePosition : positions
+    InvoicePosition --> "0..1" Discount : discount
+    OrderConfirmation --> "0..*" StatusChange : history
+    StatusChange --> "0..1" OrderStatus : from
+    StatusChange --> "1" OrderStatus : to
+    OrderConfirmation --> "0..*" Category : relatedCategories
+    Category --> "0..*" Category : children
+    OrderConfirmation --> "0..*" Shipment : shipments
+
+    note for Money "imported - no path in the sketch yet"
+    note for Stars "values of type int"
+```
+
+Both renderings are covered by
+[`SketchMermaidGeneratorTest`](sketch-first/src/test/java/SketchMermaidGeneratorTest.java) and
+[`SketchPlantUmlGeneratorTest`](sketch-first/src/test/java/SketchPlantUmlGeneratorTest.java). Neither
+a mermaid nor a PlantUML parser is on the classpath — the generators stay dependency-free, and a
+headless browser is not a test dependency — so every diagram a test produces is read back with the
+grammar its generator is allowed to emit (box declarations, stereotypes, members, `<|--`, `-->`,
+notes) and nothing else. That is what pins down the escaping rules: no member text may contain a brace
+(it would end the class body) or a parenthesis (both languages would read the line as a method), and
+every box a diagram links has to be declared in it. One test closes the loop on the shared model from
+the other side — for one sketch, the two languages must state the same boxes and the same arrows, in
+both views.
 
 ### `code-first`
 
