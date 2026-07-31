@@ -48,20 +48,50 @@ functionality. Grouped by the direction they would take the project.
 Everything below is a consequence of the DSL gaps above: the Java model states it,
 `JavaSketchGenerator` reports it, but there is no sketch syntax to carry it.
 
-- [ ] **Path and query parameters** — the DSL sigils exist now (`{petId}`, `?status`,
-  `$cookie:sid`, `$petId`), but `JavaSketchGenerator` still reports and drops
-  `@PathParam`/`@QueryParam`/`@CookieParam`; mapping them onto the sigils is the next step.
-- [ ] **`@BeanParam` trees** — a `@BeanParam` POJO is dropped as one opaque unit, so nothing
-  inside it is seen: no nested `@BeanParam` layer, and no `@QueryParam`/`@PathParam`/
-  `@HeaderParam` member at any depth — a header carried inside such a tree is lost even
-  though the DSL can express it. The members may also sit on accessors or constructor
-  parameters rather than fields, and `@DefaultValue` means the server fills the value in.
-- [ ] **`@FormParam` is a body, not a parameter** — on a `@POST` a `@BeanParam` tree may carry
-  `@FormParam` members (or `@RestForm`/`@MultipartForm`), which belong in the request *body* as
-  `application/x-www-form-urlencoded`/`multipart/form-data`. Because the body is detected as
-  "the parameter carrying no JAX-RS annotation", such a POST currently comes out with no
-  request body at all. Emitting it needs the content-type item under "Metadata control"
-  (and the binary item for file parts).
+- [x] **Path, query and cookie parameters** — done, including `@BeanParam` trees
+  (fields, setters, constructor parameters, nested beans) and
+  `@Parameter(in = DEFAULT)` mapped onto the DSL's undecided `$name`.
+- [ ] **Attributes on parameters** — `@Size`/`@Pattern`/`@Min`/`@Max`/`@DecimalMin`/
+  `@DecimalMax` on a parameter are not carried over, although the DSL accepts the `{…}`
+  block on a parameter line and covers it with a test (`?page (0 - 1) : int {min: 1}` →
+  `minimum: 1`). Nothing is missing in `sketch-first`; the gap is in `JavaSketchGenerator`:
+  - `ParameterLine` has no `attributes` member and `emitParameters` appends no
+    `attributeBlock(...)`, so there is nowhere to put them (properties have both).
+  - `toProperty` and `collectAttributes` take a `Field`, as do the `member`/`stringMember`/
+    `intMember`/`longMember`/`booleanMember` helpers. Widening them to `AnnotatedElement`
+    is mechanical now that `declaredAnnotation` already accepts one — that makes them work
+    for a method parameter, a setter and a constructor parameter alike; the message in
+    `collectAttributes` would take the walk's `Member.description()` instead of building
+    `declaringClass.fieldName` itself.
+  - **The one real structural change:** `ParameterLine` holds `collection` + `required` and
+    derives only `(1)`, `(0 - 1)`, `(0 - *)`, `(1 - *)`. On a *collection*, `@Size` describes
+    the number of elements, i.e. the occurrence (the rule properties already follow), so
+    `@Size(min = 1, max = 5) List<String> tags` has to become `?tag (1 - 5) : string` — a
+    bounded range the record cannot represent. It needs `min`/`max` like `Property`, with
+    `required` derived rather than stored.
+  - The existing type rules carry over unchanged and need the same reporting:
+    `minLength`/`maxLength`/`pattern` only on the plain `string` built-in (so `@Size` on a
+    `UUID` path parameter is dropped and reported), `min`/`max` only on numerics, and no
+    attributes at all on an enum parameter — the DSL rejects those outright.
+- [ ] **`@DefaultValue` loses its value** — it is read for required-ness only (a parameter
+  with a default may be left out), while the default itself is dropped without a word. The
+  DSL has no `default` attribute yet, so this needs the "Documentation attributes" item
+  above first. Worth listing separately because `@DefaultValue` is common on query
+  parameters, so this is real information loss, not just an unmapped annotation.
+- [ ] **The regex inside a `@Path` template** — `@Path("/{id: \\d+}")` constrains the path
+  parameter, and `TEMPLATE_PARAMETER` parses only the name, dropping the `: \\d+` silently.
+  It maps onto `{id} (1) : string {pattern: "\\d+"}`, but only for a `string` parameter: on
+  the `long` such a template usually guards, the DSL rightly rejects `pattern`, so it would
+  have to be dropped and reported.
+- [ ] **Parameters declared on resource class fields** — JAX-RS also allows
+  `@QueryParam`/`@HeaderParam` on a *field of the resource class*, injected per request and
+  therefore applying to every endpoint of it. Only method parameters and `@BeanParam` trees
+  are read today.
+- [ ] **`@FormParam` bodies** — a form parameter is an error for now (it belongs in the
+  request body as `application/x-www-form-urlencoded`, which the DSL cannot express while
+  json is its only content type). Emitting it needs the content-type item under
+  "Metadata control", and the binary item for multipart file parts.
+- [ ] **`@MatrixParam`** — reported and dropped: OpenAPI has no matrix location at all.
 - [ ] **Error responses** — only the 2xx payload is emitted; a resource's 404/400
   bodies have no place in a one-operation sketch.
 - [ ] **The real HTTP path** — the yaml path comes from the sketch file name

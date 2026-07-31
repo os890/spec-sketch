@@ -1,36 +1,54 @@
 openapi: 3.0.3
 info:
-  title: 'getPet API (generated from SpecSketch)'
+  title: 'searchPets API (generated from SpecSketch)'
   version: 1.0.0
 paths:
-  '/getPet/{petId}':
+  '/searchPets':
     get:
       operationId: getPet
       parameters:
-        - name: petId
-          in: path
-          required: true
+        - name: status
+          in: query
           schema:
-            type: integer
-            format: int64
+            '$ref': '#/components/schemas/PetStatus'
+        - name: tag
+          in: query
+          schema:
+            type: array
+            items:
+              type: string
         - name: X-Request-Id
           in: header
           schema:
             type: string
             format: uuid
+        - name: page
+          in: query
+          schema:
+            type: integer
+            format: int32
+        - name: size
+          in: query
+          schema:
+            type: integer
+            format: int32
       responses:
         '200':
           description: 'Generated from SpecSketch definition ''response'''
-          headers:
-            X-Cache-Hit:
-              schema:
-                type: boolean
           content:
             'application/json':
               schema:
-                '$ref': '#/components/schemas/Pet'
+                type: array
+                items:
+                  '$ref': '#/components/schemas/Pet'
 components:
   schemas:
+    PetStatus:
+      type: string
+      enum:
+        - AVAILABLE
+        - PENDING
+        - SOLD
     Pet:
       type: object
       required:
@@ -62,12 +80,6 @@ components:
           format: date
         owner:
           '$ref': '#/components/schemas/Owner'
-    PetStatus:
-      type: string
-      enum:
-        - AVAILABLE
-        - PENDING
-        - SOLD
     Category:
       type: object
       required:

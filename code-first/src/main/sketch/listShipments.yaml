@@ -3,9 +3,16 @@ info:
   title: 'listShipments API (generated from SpecSketch)'
   version: 1.0.0
 paths:
-  '/listShipments':
+  '/listShipments/{petId}':
     get:
       operationId: getShipment
+      parameters:
+        - name: petId
+          in: path
+          required: true
+          schema:
+            type: integer
+            format: int64
       responses:
         '200':
           description: 'Generated from SpecSketch definition ''response'''

@@ -14,6 +14,8 @@
 
 import java.io.IOException;
 import java.lang.annotation.Annotation;
+import java.lang.reflect.AnnotatedElement;
+import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.lang.reflect.Modifier;
@@ -50,6 +52,8 @@ import java.util.Set;
 import java.util.TreeSet;
 import java.util.UUID;
 import java.util.jar.JarFile;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 /**
  * Java (code-first) -> SpecSketch -> OpenAPI 3 (YAML). The mirror image of SpecSketchGenerator:
@@ -69,17 +73,36 @@ import java.util.jar.JarFile;
  *             failing that, from an explicit mapping passed to the generator
  *             (--response <method>=<class>, optionally with a [] suffix for a list). If none of
  *             them resolves, the endpoint is an error rather than a silently empty response.
- * Headers:    @HeaderParam parameters (and @Parameter(in = HEADER)) become request headers,
- *             @APIResponse(headers = @Header(...)) become response headers - the '@' lines of the
- *             DSL, required when @NotNull/@Parameter(required)/@Header(required) says so. Path and
- *             query parameters have no DSL equivalent yet and are reported.
+ * Parameters: @PathParam/@QueryParam/@HeaderParam/@CookieParam (and @Parameter(in = ...)) become
+ *             the DSL's parameter lines - '{petId}', '?status', '@X-Request-Id', '$cookie:session'.
+ *             @APIResponse(headers = @Header(...)) become the response part's '@' lines. Required
+ *             when @NotNull/@NotEmpty/@NotBlank or @Parameter(required)/@Header(required) says so,
+ *             never when @DefaultValue does (the server fills the value in, so the client may leave
+ *             it out), and always for a path parameter, which OpenAPI has no optional form for. A
+ *             collection parameter is a repeatable one. Path parameters are emitted in the order
+ *             the resource's @Path templates name them, because that is the order the DSL appends
+ *             them to the derived path in; one that no template contains is reported.
+ *             @Parameter(in = DEFAULT) states a parameter without stating where it comes from, and
+ *             becomes the DSL's undecided '$name' - reported, since the yaml then guesses a query
+ *             parameter. @MatrixParam and @Context have no place in the document and are reported.
+ *             @FormParam is an error: it belongs in the request body as
+ *             application/x-www-form-urlencoded, which the DSL cannot express yet, and dropping it
+ *             would leave a POST whose body appears nowhere.
+ * BeanParams: a @BeanParam parameter contributes whatever its POJO tree declares, at any depth:
+ *             fields, setters and constructor parameters, of the class and of its bases, with a
+ *             nested @BeanParam walked recursively. A member carrying none of the annotations is
+ *             not a parameter for JAX-RS either and is skipped; the same parameter declared twice
+ *             (field and setter, the usual case) is emitted once. A cyclic tree is an error -
+ *             JAX-RS could not inject it either.
  * Properties: non-static, non-transient declared fields, honouring @JsonIgnore and @JsonProperty.
  *             A field is required when it is a primitive, @NotNull/@NotEmpty/@NotBlank, or marked
  *             required via @Schema/@JsonProperty; everything else may be absent, which is what a
  *             nullable Java reference plus @JsonInclude(NON_NULL) actually means on the wire.
- *             @Size/@Pattern/@Min/@Max/@DecimalMin/@DecimalMax and the matching @Schema attributes
- *             become the DSL's {...} attribute block - but only where the target really is a Java
- *             String or a number, since @Size on a LocalDate cannot be validated at runtime.
+ *             @Size/@Pattern/@Min/@Max/@DecimalMin/@DecimalMax become the DSL's {...} attribute
+ *             block - but only where the target really is a Java String or a number, since @Size on
+ *             a LocalDate cannot be validated at runtime. The constraints come from Bean Validation
+ *             only: of @Schema nothing but 'required' is read, and no attribute of it at all. And
+ *             only fields carry them - a parameter line gets no attribute block yet (see todo.md).
  * Layout:     the request/response part carries the structural tree: every type is defined at its
  *             first usage, so the tree mirrors the DECLARED types of the properties. A base type
  *             shows its own properties and subtree there; what a subtype adds - including a subtree
@@ -192,11 +215,42 @@ public final class JavaSketchGenerator {
     record Endpoint(String methodName, String httpMethod, String path,
                     Class<?> requestType, boolean requestIsCollection,
                     Class<?> responseType, boolean responseIsCollection,
-                    Map<String, Header> requestHeaders, Map<String, Header> responseHeaders) {
+                    List<ParameterLine> requestParameters, List<ParameterLine> responseHeaders) {
     }
 
-    /** A header line: the type behind it and whether the header has to be present. */
-    record Header(Class<?> type, boolean required) {
+    /**
+     * Where a parameter comes from - the locations the DSL has a sigil for. UNSPECIFIED is its
+     * draft form '$name', which reflection only ever produces for @Parameter(in = DEFAULT): every
+     * JAX-RS annotation names its location, so the Java side normally knows it.
+     */
+    enum ParamIn {
+        PATH, QUERY, HEADER, COOKIE, UNSPECIFIED;
+
+        /** The name as the DSL spells it at this location. */
+        String sigil(String name) {
+            return switch (this) {
+                case PATH -> "{" + name + "}";
+                case QUERY -> "?" + name;
+                case HEADER -> "@" + name;
+                case COOKIE -> "$cookie:" + name;
+                case UNSPECIFIED -> "$" + name;
+            };
+        }
+    }
+
+    /** One parameter line to emit: the sigil, the occurrence and the type behind it. */
+    record ParameterLine(String name, ParamIn in, Class<?> type, boolean collection, boolean required) {
+
+        String sigilName() {
+            return in.sigil(name);
+        }
+
+        String occurrence() {
+            if (collection) {
+                return required ? "(1 - *)" : "(0 - *)";
+            }
+            return required ? "(1)" : "(0 - 1)";
+        }
     }
 
     /** Emission state: which types already carry their definition, and the current walk path. */
@@ -438,22 +492,15 @@ public final class JavaSketchGenerator {
     private static Endpoint readEndpoint(Method method, String httpMethod, String basePath,
                                          Map<String, String> responseTypes, List<String> messages) {
         String path = basePath + pathOf(method);
-        Map<String, Header> requestHeaders = new LinkedHashMap<>();
+        List<ParameterLine> parameters = new ArrayList<>();
         Class<?> requestType = null;
         boolean requestIsCollection = false;
         for (Parameter parameter : method.getParameters()) {
-            String headerName = headerNameOf(parameter);
-            if (headerName != null) {
-                requestHeaders.put(headerName, new Header(parameter.getType(),
-                        isRequiredHeader(parameter)));
+            Member member = Member.of(parameter, method.getName());
+            if (readParameters(member, parameters, new ArrayDeque<>(), messages)) {
                 continue;
             }
-            String ignored = ignoredParameterKind(parameter);
-            if (ignored != null) {
-                messages.add("warning: " + method.getName() + ": " + ignored
-                        + " is not expressible in SpecSketch yet and was dropped");
-                continue;
-            }
+            // a parameter carrying none of the JAX-RS parameter annotations is the request body
             if (requestType != null) {
                 throw new GeneratorException(method.getName() + " has more than one body parameter");
             }
@@ -462,7 +509,265 @@ public final class JavaSketchGenerator {
         }
         ResponsePayload response = resolveResponseType(method, responseTypes, messages);
         return new Endpoint(method.getName(), httpMethod, path, requestType, requestIsCollection,
-                response.type(), response.collection(), requestHeaders, responseHeadersOf(method));
+                response.type(), response.collection(),
+                orderedForPathTemplate(method.getName(), path, parameters, messages),
+                responseHeadersOf(method));
+    }
+
+    /**
+     * One place that may carry a parameter annotation. JAX-RS allows them on a method parameter, on
+     * a field and on a bean property, so a @BeanParam tree has to be walked through all three -
+     * they differ only in where the type and the annotations come from.
+     */
+    private record Member(AnnotatedElement element, Class<?> type, Type genericType,
+                          String description) {
+
+        /** A method or constructor parameter; the owner names it, since 'arg0' would not. */
+        static Member of(Parameter parameter, String owner) {
+            return new Member(parameter, parameter.getType(), parameter.getParameterizedType(), owner);
+        }
+
+        static Member of(Field field) {
+            return new Member(field, field.getType(), field.getGenericType(),
+                    field.getDeclaringClass().getSimpleName() + "." + field.getName());
+        }
+
+        /** A setter: the annotated property is the value it takes, not what the method returns. */
+        static Member of(Method setter) {
+            return new Member(setter, setter.getParameterTypes()[0], setter.getGenericParameterTypes()[0],
+                    setter.getDeclaringClass().getSimpleName() + "." + setter.getName());
+        }
+    }
+
+    /** The JAX-RS parameter annotations that map straight onto a DSL sigil. */
+    private static final Map<String, ParamIn> PARAMETER_ANNOTATIONS = parameterAnnotations();
+
+    private static Map<String, ParamIn> parameterAnnotations() {
+        Map<String, ParamIn> annotations = new LinkedHashMap<>();
+        annotations.put("jakarta.ws.rs.PathParam", ParamIn.PATH);
+        annotations.put("jakarta.ws.rs.QueryParam", ParamIn.QUERY);
+        annotations.put("jakarta.ws.rs.HeaderParam", ParamIn.HEADER);
+        annotations.put("jakarta.ws.rs.CookieParam", ParamIn.COOKIE);
+        return annotations;
+    }
+
+    /**
+     * Reads what one member contributes to the operation's parameters: itself, or - for @BeanParam -
+     * everything its POJO tree declares, at any depth.
+     *
+     * @return whether the member is a parameter at all; false means it is the request body
+     */
+    private static boolean readParameters(Member member, List<ParameterLine> into,
+                                          Deque<Class<?>> beans, List<String> messages) {
+        if (declaredAnnotation(member.element(), "jakarta.ws.rs.BeanParam") != null) {
+            readBeanParameters(member, into, beans, messages);
+            return true;
+        }
+        Annotation form = declaredAnnotation(member.element(), "jakarta.ws.rs.FormParam");
+        if (form != null) {
+            // dropping it would leave a POST whose body is nowhere in the document, and a form body
+            // cannot be described while application/json is the only content type the DSL emits
+            throw new GeneratorException(member.description() + ": form parameter '"
+                    + invoke(form, "value") + "' belongs in the request body as"
+                    + " application/x-www-form-urlencoded, which SpecSketch cannot express yet"
+                    + " (application/json is its only content type) - the operation would come out"
+                    + " with no request body at all");
+        }
+        for (Map.Entry<String, ParamIn> candidate : PARAMETER_ANNOTATIONS.entrySet()) {
+            Annotation annotation = declaredAnnotation(member.element(), candidate.getKey());
+            if (annotation != null) {
+                addParameter(into, member, String.valueOf(invoke(annotation, "value")),
+                        candidate.getValue(), messages);
+                return true;
+            }
+        }
+        Annotation openApi = declaredAnnotation(member.element(), OPEN_API + ".parameters.Parameter");
+        if (openApi != null) {
+            // @Parameter(in = DEFAULT) says a parameter without saying where from - which is
+            // exactly what the DSL's '$name' means, so it is passed on as undecided
+            ParamIn in = openApiLocation(enumName(invoke(openApi, "in")));
+            String name = String.valueOf(invoke(openApi, "name"));
+            if (in == ParamIn.UNSPECIFIED) {
+                messages.add("warning: " + member.description() + ": @Parameter(in = DEFAULT) does not"
+                        + " say where '" + name + "' comes from - emitted as the DSL's undecided"
+                        + " '$" + name + "'");
+            }
+            addParameter(into, member, name, in, messages);
+            return true;
+        }
+        String unsupported = unsupportedParameterKind(member.element());
+        if (unsupported != null) {
+            messages.add("warning: " + member.description() + ": " + unsupported
+                    + " is not expressible in SpecSketch yet and was dropped");
+            return true;
+        }
+        return false;
+    }
+
+    /**
+     * A @BeanParam POJO contributes whatever its tree declares: its own members, those of its bases,
+     * and recursively those of a nested @BeanParam. A member without any of the annotations is not
+     * a parameter for JAX-RS either, so it is skipped without a word.
+     */
+    private static void readBeanParameters(Member bean, List<ParameterLine> into,
+                                           Deque<Class<?>> beans, List<String> messages) {
+        Class<?> type = bean.type();
+        if (beans.contains(type)) {
+            throw new GeneratorException(bean.description() + ": @BeanParam type "
+                    + type.getSimpleName() + " contains itself - JAX-RS cannot inject a cyclic"
+                    + " bean tree, and the walk would not terminate");
+        }
+        beans.push(type);
+        for (Member member : parameterMembersOf(type)) {
+            // JAX-RS ignores an unannotated member of a bean, so 'not a parameter' means 'not ours'
+            readParameters(member, into, beans, messages);
+        }
+        beans.pop();
+    }
+
+    /**
+     * The members of a bean class that may carry an annotation: its fields, its setters and its
+     * constructor parameters, bases first. Methods and constructors are sorted, because reflection
+     * does not promise an order and the emitted sketch is a versioned file.
+     */
+    private static List<Member> parameterMembersOf(Class<?> bean) {
+        List<Class<?>> levels = new ArrayList<>();
+        for (Class<?> level = bean; level != null && level != Object.class; level = level.getSuperclass()) {
+            levels.add(level);
+        }
+        java.util.Collections.reverse(levels);
+        List<Member> members = new ArrayList<>();
+        for (Class<?> level : levels) {
+            for (Field field : level.getDeclaredFields()) {
+                if (!field.isSynthetic() && !Modifier.isStatic(field.getModifiers())) {
+                    members.add(Member.of(field));
+                }
+            }
+            List<Method> setters = new ArrayList<>();
+            for (Method method : level.getDeclaredMethods()) {
+                if (!method.isSynthetic() && method.getParameterCount() == 1) {
+                    setters.add(method);
+                }
+            }
+            setters.sort(Comparator.comparing(Method::getName));
+            setters.forEach(setter -> members.add(Member.of(setter)));
+            List<Constructor<?>> constructors =
+                    new ArrayList<>(List.of(level.getDeclaredConstructors()));
+            constructors.sort(Comparator.comparing(Constructor::toString));
+            for (Constructor<?> constructor : constructors) {
+                for (Parameter parameter : constructor.getParameters()) {
+                    members.add(Member.of(parameter, level.getSimpleName()));
+                }
+            }
+        }
+        return members;
+    }
+
+    /**
+     * Adds one parameter line, unless the same one is already there: a bean regularly carries the
+     * annotation on both the field and its setter, and JAX-RS injects one parameter from it. Two
+     * declarations that disagree about the type or the occurrence are a contradiction, so those are
+     * reported instead of being silently collapsed.
+     */
+    private static void addParameter(List<ParameterLine> into, Member member, String name, ParamIn in,
+                                     List<String> messages) {
+        Class<?> raw = member.type();
+        boolean collection = isCollection(raw);
+        Class<?> type = raw == byte[].class || raw == Byte[].class
+                ? null // base64 content, not a repeated number - and there is no binary built-in
+                : elementTypeOf(member.genericType(), raw);
+        if (type == null || (!type.isEnum() && !BUILT_INS.containsKey(type))) {
+            messages.add("warning: " + member.description() + ": " + in.sigil(name) + " of type "
+                    + raw.getSimpleName() + " is not expressible in SpecSketch yet and was dropped"
+                    + " - a parameter carries a built-in type or an enum");
+            return;
+        }
+        ParameterLine parameter = new ParameterLine(name, in, type, collection,
+                in == ParamIn.PATH || isRequiredParameter(member));
+        for (ParameterLine declared : into) {
+            if (!declared.name().equals(name) || declared.in() != in) {
+                continue;
+            }
+            if (!declared.equals(parameter)) {
+                messages.add("warning: " + member.description() + ": " + in.sigil(name)
+                        + " is declared more than once, as " + declared.occurrence() + " : "
+                        + sketchTypeName(declared.type()) + " and as " + parameter.occurrence()
+                        + " : " + sketchTypeName(type) + " - the first one was kept");
+            }
+            return;
+        }
+        into.add(parameter);
+    }
+
+    /**
+     * A required parameter. @DefaultValue wins over @NotNull: the server fills the value in, so the
+     * client may leave it out, which is what 'required' describes. A primitive says nothing here -
+     * unlike a DTO field, an absent 'int' parameter is injected as 0.
+     */
+    private static boolean isRequiredParameter(Member member) {
+        AnnotatedElement element = member.element();
+        if (declaredAnnotation(element, "jakarta.ws.rs.DefaultValue") != null) {
+            return false;
+        }
+        if (declaredAnnotation(element, "jakarta.validation.constraints.NotNull") != null
+                || declaredAnnotation(element, "jakarta.validation.constraints.NotEmpty") != null
+                || declaredAnnotation(element, "jakarta.validation.constraints.NotBlank") != null) {
+            return true;
+        }
+        Annotation openApi = declaredAnnotation(element, OPEN_API + ".parameters.Parameter");
+        return openApi != null && Boolean.TRUE.equals(invoke(openApi, "required"));
+    }
+
+    private static ParamIn openApiLocation(String parameterIn) {
+        return switch (parameterIn) {
+            case "PATH" -> ParamIn.PATH;
+            case "QUERY" -> ParamIn.QUERY;
+            case "HEADER" -> ParamIn.HEADER;
+            case "COOKIE" -> ParamIn.COOKIE;
+            default -> ParamIn.UNSPECIFIED; // 'DEFAULT', i.e. the annotation does not say
+        };
+    }
+
+    /** Names in a '{...}' segment of a @Path template, in the order the template lists them. */
+    private static final Pattern TEMPLATE_PARAMETER = Pattern.compile("\\{\\s*([A-Za-z_][A-Za-z0-9_-]*)\\s*(?::[^{}]*)?}");
+
+    /**
+     * Path parameters in the order the real @Path template names them, everything else in
+     * declaration order. The DSL appends path parameters to the derived path in the order it reads
+     * them, while a Java signature is free to list them in any order; taking the template's order
+     * also makes the result independent of it. A name no template contains is reported - JAX-RS
+     * could not inject it either.
+     */
+    private static List<ParameterLine> orderedForPathTemplate(String methodName, String path,
+                                                              List<ParameterLine> parameters,
+                                                              List<String> messages) {
+        List<String> template = new ArrayList<>();
+        Matcher matcher = TEMPLATE_PARAMETER.matcher(path);
+        while (matcher.find()) {
+            template.add(matcher.group(1));
+        }
+        List<ParameterLine> pathParameters = new ArrayList<>();
+        for (ParameterLine parameter : parameters) {
+            if (parameter.in() == ParamIn.PATH) {
+                pathParameters.add(parameter);
+                if (!template.contains(parameter.name())) {
+                    messages.add("warning: " + methodName + ": path parameter '{" + parameter.name()
+                            + "}' appears in no @Path template of the resource ('" + path + "'),"
+                            + " so nothing can be injected into it");
+                }
+            }
+        }
+        // unknown names keep their relative order, behind the ones the template does list
+        pathParameters.sort(Comparator.comparingInt(parameter -> {
+            int index = template.indexOf(parameter.name());
+            return index < 0 ? template.size() : index;
+        }));
+        List<ParameterLine> ordered = new ArrayList<>();
+        int next = 0;
+        for (ParameterLine parameter : parameters) {
+            ordered.add(parameter.in() == ParamIn.PATH ? pathParameters.get(next++) : parameter);
+        }
+        return ordered;
     }
 
     private record ResponsePayload(Class<?> type, boolean collection) {
@@ -533,19 +838,39 @@ public final class JavaSketchGenerator {
         List<String> lines = new ArrayList<>();
         lines.add("# Generated by JavaSketchGenerator from " + endpoint.httpMethod().toUpperCase()
                 + " " + endpoint.path());
-        if (!endpoint.path().equals("/" + endpoint.methodName())) {
+        String derivedPath = derivedPathOf(endpoint);
+        if (!derivedPath.equals(endpoint.path())) {
             messages.add("warning: " + endpoint.methodName() + ": the yaml path is derived from the"
-                    + " file name ('/" + endpoint.methodName() + "'), the real path '" + endpoint.path()
-                    + "' is not expressible in SpecSketch yet");
+                    + " file name and the path parameters ('" + derivedPath + "'), the real path '"
+                    + endpoint.path() + "' is not expressible in SpecSketch yet");
         }
-        if (endpoint.requestType() != null || !endpoint.requestHeaders().isEmpty()) {
+        if (endpoint.requestType() != null || !endpoint.requestParameters().isEmpty()) {
             emitPart(lines, "request", endpoint.requestType(), endpoint.requestIsCollection(),
-                    endpoint.requestHeaders(), context);
+                    endpoint.requestParameters(), capitalize(endpoint.methodName()) + "Params", context);
         }
         emitPart(lines, "response", endpoint.responseType(), endpoint.responseIsCollection(),
-                endpoint.responseHeaders(), context);
+                endpoint.responseHeaders(), capitalize(endpoint.methodName()) + "Response", context);
         emitPendingHierarchies(lines, context);
         return lines;
+    }
+
+    /**
+     * The path the yaml will carry: SpecSketchGenerator names it after the sketch file and appends
+     * one templated segment per path parameter, in the order it reads them. Knowing it here is what
+     * lets the generator say whether it matches the resource's real @Path.
+     */
+    private static String derivedPathOf(Endpoint endpoint) {
+        StringBuilder path = new StringBuilder("/").append(endpoint.methodName());
+        for (ParameterLine parameter : endpoint.requestParameters()) {
+            if (parameter.in() == ParamIn.PATH) {
+                path.append("/{").append(parameter.name()).append('}');
+            }
+        }
+        return path.toString();
+    }
+
+    private static String capitalize(String name) {
+        return name.substring(0, 1).toUpperCase() + name.substring(1);
     }
 
     /**
@@ -585,29 +910,29 @@ public final class JavaSketchGenerator {
     }
 
     private static void emitPart(List<String> lines, String part, Class<?> type, boolean collection,
-                                 Map<String, Header> headers, Context context) {
+                                 List<ParameterLine> parameters, String parameterOnlyType,
+                                 Context context) {
         if (type == null) {
-            // headers only: no body, which keeps the operation a GET
-            lines.add(part + " (1) : " + part.substring(0, 1).toUpperCase() + part.substring(1) + "Headers");
-            emitHeaders(lines, headers, context);
+            // parameters only: no body, which keeps the operation a GET. The type name is never
+            // referenced by the document - a part without body properties has no schema at all
+            lines.add(part + " (1) : " + parameterOnlyType);
+            emitParameters(lines, parameters, context);
             return;
         }
-        String typeName = sketchTypeName(type, context);
+        String typeName = sketchTypeName(type);
         lines.add(part + " " + (collection ? "(0 - *)" : "(1)") + " : " + typeName);
-        emitHeaders(lines, headers, context);
+        emitParameters(lines, parameters, context);
         if (!inlineDefinition(lines, type, 1, context) && isHierarchyMember(type, context)) {
             queueHierarchy(type, context);
         }
     }
 
-    private static void emitHeaders(List<String> lines, Map<String, Header> headers, Context context) {
-        for (Map.Entry<String, Header> entry : headers.entrySet()) {
-            Header header = entry.getValue();
-            String typeName = header.type().isEnum()
-                    ? enumDeclaration(header.type(), context)
-                    : sketchTypeName(header.type(), context);
-            lines.add(indent(1) + "@" + entry.getKey() + " " + (header.required() ? "(1)" : "(0 - 1)")
-                    + " : " + typeName);
+    private static void emitParameters(List<String> lines, List<ParameterLine> parameters, Context context) {
+        for (ParameterLine parameter : parameters) {
+            String typeName = parameter.type().isEnum()
+                    ? enumDeclaration(parameter.type(), context)
+                    : sketchTypeName(parameter.type());
+            lines.add(indent(1) + parameter.sigilName() + " " + parameter.occurrence() + " : " + typeName);
         }
     }
 
@@ -958,7 +1283,7 @@ public final class JavaSketchGenerator {
 
     // ----------------------------------------------------------------- helpers
 
-    private static String sketchTypeName(Class<?> type, Context context) {
+    private static String sketchTypeName(Class<?> type) {
         if (type.isEnum()) {
             return type.getSimpleName();
         }
@@ -1278,46 +1603,19 @@ public final class JavaSketchGenerator {
         return null;
     }
 
-    private static String headerNameOf(Parameter parameter) {
-        Annotation headerParam = declaredAnnotation(parameter, "jakarta.ws.rs.HeaderParam");
-        if (headerParam != null) {
-            return String.valueOf(invoke(headerParam, "value"));
-        }
-        Annotation openApi = declaredAnnotation(parameter, OPEN_API + ".parameters.Parameter");
-        // ParameterIn overrides toString() ('header'), so the comparison has to use the constant
-        if (openApi != null && "HEADER".equals(enumName(invoke(openApi, "in")))) {
-            return String.valueOf(invoke(openApi, "name"));
-        }
-        return null;
-    }
-
-    /** A required request header: either the parameter is @NotNull or @Parameter says so. */
-    private static boolean isRequiredHeader(Parameter parameter) {
-        for (Annotation annotation : parameter.getDeclaredAnnotations()) {
-            if (annotation.annotationType().getName().equals("jakarta.validation.constraints.NotNull")) {
-                return true;
-            }
-        }
-        Annotation openApi = declaredAnnotation(parameter, OPEN_API + ".parameters.Parameter");
-        return openApi != null && Boolean.TRUE.equals(invoke(openApi, "required"));
-    }
-
-    /** Path/query/cookie/form parameters and injected context - none of them is a body. */
-    private static String ignoredParameterKind(Parameter parameter) {
+    /**
+     * The parameter kinds that have no place in the document: OpenAPI knows no matrix parameter,
+     * and an injected context is server plumbing rather than part of the contract.
+     */
+    private static String unsupportedParameterKind(AnnotatedElement element) {
         Map<String, String> kinds = new LinkedHashMap<>();
-        kinds.put("jakarta.ws.rs.PathParam", "path parameter");
-        kinds.put("jakarta.ws.rs.QueryParam", "query parameter");
-        kinds.put("jakarta.ws.rs.CookieParam", "cookie parameter");
-        kinds.put("jakarta.ws.rs.FormParam", "form parameter");
         kinds.put("jakarta.ws.rs.MatrixParam", "matrix parameter");
-        kinds.put("jakarta.ws.rs.BeanParam", "bean parameter");
         kinds.put("jakarta.ws.rs.core.Context", "injected context");
         for (Map.Entry<String, String> kind : kinds.entrySet()) {
-            Annotation annotation = declaredAnnotation(parameter, kind.getKey());
+            Annotation annotation = declaredAnnotation(element, kind.getKey());
             if (annotation != null) {
                 Object value = invoke(annotation, "value");
-                String name = value == null ? parameter.getName() : String.valueOf(value);
-                return kind.getValue() + " '" + name + "'";
+                return kind.getValue() + (value == null ? "" : " '" + value + "'");
             }
         }
         return null;
@@ -1343,8 +1641,9 @@ public final class JavaSketchGenerator {
         return null;
     }
 
-    private static Map<String, Header> responseHeadersOf(Method method) {
-        Map<String, Header> headers = new LinkedHashMap<>();
+    /** Response headers: the only parameters a response part can carry, all of them '@' lines. */
+    private static List<ParameterLine> responseHeadersOf(Method method) {
+        Map<String, ParameterLine> headers = new LinkedHashMap<>();
         for (Annotation response : apiResponsesOf(method)) {
             Object declared = invoke(response, "headers");
             if (!(declared instanceof Object[] entries)) {
@@ -1359,10 +1658,11 @@ public final class JavaSketchGenerator {
                         && impl != Void.class) {
                     type = impl;
                 }
-                headers.put(name, new Header(type, Boolean.TRUE.equals(invoke(header, "required"))));
+                headers.put(name, new ParameterLine(name, ParamIn.HEADER, type, false,
+                        Boolean.TRUE.equals(invoke(header, "required"))));
             }
         }
-        return headers;
+        return new ArrayList<>(headers.values());
     }
 
     private static List<Annotation> apiResponsesOf(Method method) {
@@ -1384,35 +1684,9 @@ public final class JavaSketchGenerator {
         return declaredAnnotation(field, className) != null;
     }
 
-    private static Annotation declaredAnnotation(Class<?> type, String className) {
-        for (Annotation annotation : type.getDeclaredAnnotations()) {
-            if (annotation.annotationType().getName().equals(className)) {
-                return annotation;
-            }
-        }
-        return null;
-    }
-
-    private static Annotation declaredAnnotation(Method method, String className) {
-        for (Annotation annotation : method.getDeclaredAnnotations()) {
-            if (annotation.annotationType().getName().equals(className)) {
-                return annotation;
-            }
-        }
-        return null;
-    }
-
-    private static Annotation declaredAnnotation(Field field, String className) {
-        for (Annotation annotation : field.getDeclaredAnnotations()) {
-            if (annotation.annotationType().getName().equals(className)) {
-                return annotation;
-            }
-        }
-        return null;
-    }
-
-    private static Annotation declaredAnnotation(Parameter parameter, String className) {
-        for (Annotation annotation : parameter.getDeclaredAnnotations()) {
+    /** Serves a class, a method, a field and a parameter alike - a bean tree carries all four. */
+    private static Annotation declaredAnnotation(AnnotatedElement element, String className) {
+        for (Annotation annotation : element.getDeclaredAnnotations()) {
             if (annotation.annotationType().getName().equals(className)) {
                 return annotation;
             }

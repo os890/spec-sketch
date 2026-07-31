@@ -478,14 +478,31 @@ per file), side by side under `src/main/sketch/`, both under version control.
   `{…}` attribute block; on a collection `@Size` becomes the occurrence instead. `@Size`/`@Pattern`
   on a `LocalDate` or `UUID` is dropped **and reported**, because the resulting `@Size`/`@Pattern`
   could not be validated at runtime (see the same rule in `sketch-first`).
-- **Headers** — `@HeaderParam` parameters (and `@Parameter(in = ParameterIn.HEADER)`) become
-  request header lines, `@APIResponse(headers = @Header(…))` become response header lines. A
-  header is required when `@NotNull`, `@Parameter(required = true)` or `@Header(required = true)`
-  says so.
-- **Everything this generator does not map yet is reported, never dropped silently**: path, query,
-  cookie, form and `@BeanParam` parameters (the DSL grew sigils for the first three, the Java side
-  is not wired to them yet), non-200 responses, `Map` and `byte[]` members, and the fact that the
-  yaml path is derived from the file name rather than from `@Path`.
+- **Parameters** — `@PathParam`/`@QueryParam`/`@HeaderParam`/`@CookieParam` (and
+  `@Parameter(in = …)`) become the DSL's parameter lines `{petId}`, `?status`, `@X-Request-Id`,
+  `$cookie:session`; `@APIResponse(headers = @Header(…))` become the response part's `@` lines. A
+  parameter is required when `@NotNull`/`@NotEmpty`/`@NotBlank` or `@Parameter(required = true)`
+  says so, never when `@DefaultValue` does (the server fills the value in, so the client may leave
+  it out), and always when it is a path parameter. A collection parameter is a repeatable one. Note
+  a primitive parameter is *not* required — unlike a primitive DTO field, an absent `int` parameter
+  is injected as `0`. Path parameters are emitted in the order the resource's `@Path` templates
+  name them, since that is the order the DSL appends them to the derived path in; one that appears
+  in no template is reported. `@Parameter(in = DEFAULT)` states a parameter without stating where
+  it comes from and becomes the DSL's undecided `$name` (reported, as it is there too).
+- **`@BeanParam` trees** — a bean parameter contributes whatever its POJO tree declares, at any
+  depth: fields, setters and constructor parameters, of the class and of its bases, with a nested
+  `@BeanParam` walked recursively. A member carrying none of the annotations is not a parameter for
+  JAX-RS either and is skipped; the same parameter declared twice (on the field *and* its setter,
+  the usual case) is emitted once. A cyclic tree is an error — JAX-RS could not inject it either.
+  [`PetSearch`](code-first/src/main/java/org/os890/sketch/petstore/PetSearch.java) and its nested
+  [`Paging`](code-first/src/main/java/org/os890/sketch/petstore/Paging.java) show it in the demo.
+- **`@FormParam` is an error**, not a warning: it belongs in the request body as
+  `application/x-www-form-urlencoded`, which the DSL cannot express while `application/json` is its
+  only content type — and dropping it would leave a POST whose body appears nowhere in the document.
+- **Everything else this generator cannot map is reported, never dropped silently**: `@MatrixParam`
+  (OpenAPI has no such location) and `@Context` injection, parameter types that are neither a
+  built-in nor an enum, non-200 responses, `Map` and `byte[]` members, and the fact that the yaml
+  path is derived from the file name rather than from `@Path`.
 
 Run it standalone against any resource class:
 

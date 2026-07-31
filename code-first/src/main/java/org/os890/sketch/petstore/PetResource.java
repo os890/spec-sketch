@@ -26,6 +26,7 @@ import org.eclipse.microprofile.openapi.annotations.media.Content;
 import org.eclipse.microprofile.openapi.annotations.media.Schema;
 import org.eclipse.microprofile.openapi.annotations.responses.APIResponse;
 import jakarta.validation.Valid;
+import jakarta.ws.rs.BeanParam;
 import jakarta.ws.rs.Consumes;
 import jakarta.ws.rs.GET;
 import jakarta.ws.rs.HeaderParam;
@@ -76,6 +77,13 @@ public class PetResource {
     @POST
     public Response createPet(@Valid NewPet newPet,
                               @HeaderParam("X-Request-Id") UUID requestId) {
+        throw new UnsupportedOperationException("demo resource: only its signatures are read");
+    }
+
+    /** Parameters gathered in a @BeanParam tree: the generator flattens it, nested layer included. */
+    @GET
+    @Path("/search")
+    public List<Pet> searchPets(@BeanParam PetSearch search) {
         throw new UnsupportedOperationException("demo resource: only its signatures are read");
     }
 

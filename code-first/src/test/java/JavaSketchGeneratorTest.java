@@ -40,13 +40,20 @@ import jakarta.validation.constraints.Min;
 import jakarta.validation.constraints.NotNull;
 import jakarta.validation.constraints.Pattern;
 import jakarta.validation.constraints.Size;
+import jakarta.ws.rs.BeanParam;
+import jakarta.ws.rs.CookieParam;
+import jakarta.ws.rs.DefaultValue;
+import jakarta.ws.rs.FormParam;
 import jakarta.ws.rs.GET;
 import jakarta.ws.rs.HeaderParam;
+import jakarta.ws.rs.MatrixParam;
 import jakarta.ws.rs.POST;
 import jakarta.ws.rs.Path;
 import jakarta.ws.rs.PathParam;
 import jakarta.ws.rs.QueryParam;
+import jakarta.ws.rs.core.Context;
 import jakarta.ws.rs.core.Response;
+import jakarta.ws.rs.core.UriInfo;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.yaml.snakeyaml.Yaml;
@@ -437,6 +444,147 @@ class JavaSketchGeneratorTest {
         public String notAnEndpoint() {
             return null;
         }
+    }
+
+    /** Its own resource: every parameter location, and every way a bean tree can carry them. */
+    @Path("/params")
+    static class ParameterResource {
+
+        @GET
+        @Path("/all/{id}")
+        public Occurrences allLocations(@PathParam("id") long id,
+                                        @QueryParam("q") String q,
+                                        @CookieParam("session") UUID session,
+                                        @HeaderParam("X-Trace") String trace) {
+            return null;
+        }
+
+        @GET
+        @Path("/bean/{id}")
+        public Occurrences bean(@BeanParam Filter filter) {
+            return null;
+        }
+
+        @GET
+        @Path("/accessors")
+        public Occurrences accessors(@BeanParam AccessorBean bean) {
+            return null;
+        }
+
+        /** The signature lists them the other way round; the template decides the order. */
+        @GET
+        @Path("/{first}/reordered/{second}")
+        public Occurrences reordered(@PathParam("second") long second, @PathParam("first") long first) {
+            return null;
+        }
+
+        @GET
+        @Path("/nowhere")
+        public Occurrences missingTemplate(@PathParam("ghost") long ghost) {
+            return null;
+        }
+
+        @GET
+        @Path("/ignored")
+        public Occurrences ignored(@MatrixParam("axis") String axis, @Context UriInfo uriInfo) {
+            return null;
+        }
+
+        @GET
+        @Path("/unsupported")
+        public Occurrences unsupported(@QueryParam("filter") Filter filter) {
+            return null;
+        }
+
+        @GET
+        @Path("/undecided")
+        public Occurrences undecided(@Parameter(name = "tenant") String tenant) {
+            return null;
+        }
+    }
+
+    /** A bean tree: every location, a repeatable parameter, a nested layer, and a plain member. */
+    static class Filter {
+
+        @QueryParam("status")
+        private Level status;
+
+        @QueryParam("tag")
+        private List<String> tags;
+
+        @HeaderParam("X-Bean-Header")
+        private String beanHeader;
+
+        @PathParam("id")
+        private long id;
+
+        @BeanParam
+        private Paging paging;
+
+        /** No JAX-RS annotation: not a parameter for JAX-RS either, so not one here. */
+        private String internal;
+
+        /** The same parameter as the field above - one line has to come out, not two. */
+        @QueryParam("status")
+        public void setStatus(Level status) {
+            this.status = status;
+        }
+    }
+
+    static class Paging {
+
+        @QueryParam("page")
+        @DefaultValue("0")
+        private int page;
+
+        @QueryParam("size")
+        @NotNull
+        private Integer size;
+    }
+
+    /** Annotations on a setter and on a constructor parameter, not on a field. */
+    static class AccessorBean {
+
+        private final long viaConstructor;
+        private String viaSetter;
+
+        AccessorBean(@QueryParam("ctor") long viaConstructor) {
+            this.viaConstructor = viaConstructor;
+        }
+
+        @QueryParam("setter")
+        public void setViaSetter(String viaSetter) {
+            this.viaSetter = viaSetter;
+        }
+    }
+
+    /** Its own resource: a form parameter has nowhere to go while json is the only content type. */
+    @Path("/form")
+    static class FormResource {
+
+        @POST
+        public Occurrences form(@FormParam("name") String name) {
+            return null;
+        }
+    }
+
+    /** Its own resource: a bean tree containing itself cannot be walked - or injected. */
+    @Path("/cyclic")
+    static class CyclicResource {
+
+        @GET
+        public Occurrences cyclic(@BeanParam CyclicBean bean) {
+            return null;
+        }
+    }
+
+    static class CyclicBean {
+
+        @QueryParam("q")
+        private String q;
+
+        @BeanParam
+        private CyclicBean self;
     }
 
     // ---------------------------------------------------------------- helpers
@@ -920,11 +1068,126 @@ class JavaSketchGeneratorTest {
     }
 
     @Test
-    void pathAndQueryParametersAreReportedInsteadOfSilentlyDropped() {
-        sketch("withParams");
+    void pathAndQueryParametersBecomeSigilLines() {
+        List<String> lines = sketch("withParams");
 
-        assertMessage("path parameter 'id' is not expressible");
-        assertMessage("query parameter 'q' is not expressible");
+        String sketch = text(lines);
+        assertTrue(sketch.contains("request (1) : WithParamsParams"), sketch);
+        assertTrue(sketch.contains("    {id} (1) : long"), sketch);
+        assertTrue(sketch.contains("    ?q (0 - 1) : string"), sketch);
+        // parameters are no body, so the operation stays a GET
+        String yaml = yamlOf(lines, "withParams");
+        assertTrue(yaml.contains("get:"), yaml);
+        assertFalse(yaml.contains("requestBody"), yaml);
+    }
+
+    // ------------------------------------------------------------- parameters
+
+    @Test
+    void everyParameterLocationBecomesItsSigilLine() {
+        List<String> lines = sketch(ParameterResource.class, "allLocations");
+
+        String sketch = text(lines);
+        assertTrue(sketch.contains("request (1) : AllLocationsParams"), sketch);
+        assertTrue(sketch.contains("    {id} (1) : long"), sketch);
+        assertTrue(sketch.contains("    ?q (0 - 1) : string"), sketch);
+        assertTrue(sketch.contains("    $cookie:session (0 - 1) : uuid"), sketch);
+        assertTrue(sketch.contains("    @X-Trace (0 - 1) : string"), sketch);
+
+        String yaml = yamlOf(lines, "allLocations");
+        assertTrue(yaml.contains("'/allLocations/{id}':"), yaml);
+        for (String location : List.of("in: path", "in: query", "in: cookie", "in: header")) {
+            assertTrue(yaml.contains(location), () -> location + " missing in:\n" + yaml);
+        }
+    }
+
+    @Test
+    void aBeanParamTreeIsFlattenedIntoParameterLines() {
+        List<String> lines = sketch(ParameterResource.class, "bean");
+
+        String sketch = text(lines);
+        assertTrue(sketch.contains("    ?status (0 - 1) : enum Level [LOW, HIGH]"), sketch);
+        assertTrue(sketch.contains("    ?tag (0 - *) : string"), sketch);            // a collection repeats
+        assertTrue(sketch.contains("    @X-Bean-Header (0 - 1) : string"), sketch);  // was invisible before
+        assertTrue(sketch.contains("    {id} (1) : long"), sketch);
+        assertTrue(sketch.contains("    ?page (0 - 1) : int"), sketch);              // nested, @DefaultValue
+        assertTrue(sketch.contains("    ?size (1) : int"), sketch);                  // nested, @NotNull
+        assertFalse(sketch.contains("internal"), sketch);          // no annotation, so not a parameter
+        // the field and its setter declare one parameter, not two
+        assertEquals(1, lines.stream().filter(line -> line.contains("?status")).count(), sketch);
+    }
+
+    @Test
+    void annotationsOnSettersAndConstructorParametersAreFound() {
+        String sketch = text(sketch(ParameterResource.class, "accessors"));
+
+        assertTrue(sketch.contains("    ?setter (0 - 1) : string"), sketch);
+        assertTrue(sketch.contains("    ?ctor (0 - 1) : long"), sketch);
+    }
+
+    @Test
+    void pathParametersFollowTheOrderOfThePathTemplate() {
+        // the signature lists 'second' first, the template says '/{first}/reordered/{second}' - and
+        // the DSL appends path parameters to the derived path in the order it reads them
+        List<String> lines = sketch(ParameterResource.class, "reordered");
+
+        String sketch = text(lines);
+        assertTrue(sketch.indexOf("{first}") < sketch.indexOf("{second}"), sketch);
+        assertTrue(yamlOf(lines, "reordered").contains("'/reordered/{first}/{second}':"),
+                () -> yamlOf(lines, "reordered"));
+    }
+
+    @Test
+    void aPathParameterOutsideEveryTemplateIsReported() {
+        sketch(ParameterResource.class, "missingTemplate");
+
+        assertMessage("path parameter '{ghost}' appears in no @Path template");
+    }
+
+    @Test
+    void matrixParametersAndInjectedContextAreReported() {
+        String sketch = text(sketch(ParameterResource.class, "ignored"));
+
+        assertMessage("matrix parameter 'axis' is not expressible");
+        assertMessage("injected context is not expressible");
+        assertFalse(sketch.contains("request"), sketch); // nothing left for a request part
+    }
+
+    @Test
+    void aParameterTypeWithoutADslEquivalentIsReported() {
+        sketch(ParameterResource.class, "unsupported");
+
+        assertMessage("?filter of type Filter is not expressible");
+    }
+
+    @Test
+    void anOpenApiParameterWithoutALocationBecomesTheUndecidedForm() {
+        // @Parameter(in = DEFAULT) states a parameter without stating where from - which is exactly
+        // what the DSL's '$name' means, so the guess is left to it (and reported there as well)
+        String sketch = text(sketch(ParameterResource.class, "undecided"));
+
+        assertTrue(sketch.contains("    $tenant (0 - 1) : string"), sketch);
+        assertMessage("@Parameter(in = DEFAULT) does not say where 'tenant' comes from");
+    }
+
+    @Test
+    void aFormParameterIsAnErrorBecauseItsBodyCannotBeDescribed() {
+        // dropping it leaves a POST whose body appears nowhere in the document
+        JavaSketchGenerator.GeneratorException e = assertThrows(
+                JavaSketchGenerator.GeneratorException.class,
+                () -> sketch(FormResource.class, "form"));
+
+        assertTrue(e.getMessage().contains("application/x-www-form-urlencoded"), e.getMessage());
+        assertTrue(e.getMessage().contains("no request body at all"), e.getMessage());
+    }
+
+    @Test
+    void aCyclicBeanParamTreeIsAnError() {
+        JavaSketchGenerator.GeneratorException e = assertThrows(
+                JavaSketchGenerator.GeneratorException.class,
+                () -> sketch(CyclicResource.class, "cyclic"));
+
+        assertTrue(e.getMessage().contains("contains itself"), e.getMessage());
     }
 
     @Test
@@ -1053,7 +1316,7 @@ class JavaSketchGeneratorTest {
         List<JavaSketchGenerator.GeneratedEndpoint> written =
                 JavaSketchGenerator.generate(configuration, messages);
 
-        assertEquals(4, written.size());
+        assertEquals(5, written.size());
         for (JavaSketchGenerator.GeneratedEndpoint endpoint : written) {
             assertEquals(outputDir.resolve(endpoint.methodName() + ".sketch"), endpoint.sketchFile());
             assertEquals(outputDir.resolve(endpoint.methodName() + ".yaml"), endpoint.yamlFile());
@@ -1098,11 +1361,31 @@ class JavaSketchGeneratorTest {
                 Map.of("createPet", org.os890.sketch.petstore.model.Pet.class.getName()),
                 collected);
 
-        assertEquals(4, endpoints.size());
+        assertEquals(5, endpoints.size());
         for (JavaSketchGenerator.Endpoint endpoint : endpoints) {
             List<String> lines = JavaSketchGenerator.toSketch(endpoint, collected);
             assertProcessableOpenApi(yamlOf(lines, endpoint.methodName()));
         }
+    }
+
+    @Test
+    void theDemoResourceBeanParamTreeIsFlattened() {
+        List<String> collected = new ArrayList<>();
+        JavaSketchGenerator.Endpoint searchPets = JavaSketchGenerator.readEndpoints(
+                        org.os890.sketch.petstore.PetResource.class,
+                        Map.of("createPet", org.os890.sketch.petstore.model.Pet.class.getName()),
+                        collected).stream()
+                .filter(endpoint -> endpoint.methodName().equals("searchPets"))
+                .findFirst()
+                .orElseThrow();
+
+        String sketch = text(JavaSketchGenerator.toSketch(searchPets, collected));
+        assertTrue(sketch.contains("request (1) : SearchPetsParams"), sketch);
+        assertTrue(sketch.contains("    ?status (0 - 1) : enum PetStatus [AVAILABLE, PENDING, SOLD]"), sketch);
+        assertTrue(sketch.contains("    ?tag (0 - *) : string"), sketch);
+        assertTrue(sketch.contains("    @X-Request-Id (0 - 1) : uuid"), sketch);   // inside the tree
+        assertTrue(sketch.contains("    ?page (0 - 1) : int"), sketch);            // nested layer
+        assertTrue(sketch.contains("    ?size (0 - 1) : int"), sketch);
     }
 
     @Test
