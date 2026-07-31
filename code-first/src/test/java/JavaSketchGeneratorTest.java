@@ -48,6 +48,7 @@ import jakarta.ws.rs.PathParam;
 import jakarta.ws.rs.QueryParam;
 import jakarta.ws.rs.core.Response;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 import org.yaml.snakeyaml.Yaml;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -465,12 +466,17 @@ class JavaSketchGeneratorTest {
                         .orElseThrow(() -> new AssertionError("no endpoint named " + method));
         List<String> lines = JavaSketchGenerator.toSketch(endpoint, declaredSubtypes, messages);
         // the emitted sketch must be valid DSL input, and its document processable OpenAPI
-        assertProcessableOpenApi(SpecSketchGenerator.generateYaml(lines, method));
+        assertProcessableOpenApi(yamlOf(lines, method));
         return lines;
     }
 
     private static String text(List<String> lines) {
         return String.join("\n", lines);
+    }
+
+    /** The sketch translated to yaml; what the DSL reports about it belongs to its own tests. */
+    private static String yamlOf(List<String> sketchLines, String baseName) {
+        return SpecSketchGenerator.generateYaml(sketchLines, baseName, new ArrayList<>());
     }
 
     private void assertMessage(String fragment) {
@@ -763,7 +769,7 @@ class JavaSketchGeneratorTest {
 
     @Test
     void theHierarchyYamlCarriesDiscriminatorAndTransitiveMapping() {
-        String yaml = SpecSketchGenerator.generateYaml(sketch("hierarchy"), "hierarchy");
+        String yaml = yamlOf(sketch("hierarchy"), "hierarchy");
 
         assertTrue(yaml.contains("propertyName: kind"));
         assertTrue(yaml.contains("Mid: '#/components/schemas/Mid'"));
@@ -847,7 +853,7 @@ class JavaSketchGeneratorTest {
 
     @Test
     void collectionsBecomeArraysInTheDocument() {
-        String yaml = SpecSketchGenerator.generateYaml(sketch("occurrences"), "occurrences");
+        String yaml = yamlOf(sketch("occurrences"), "occurrences");
 
         assertTrue(yaml.contains("minItems: 1"));
         assertTrue(yaml.contains("maxItems: 3"));
@@ -910,7 +916,7 @@ class JavaSketchGeneratorTest {
         assertTrue(sketch.contains("    @X-Client-Id (0 - 1) : uuid"));
         assertTrue(sketch.contains("response (1) : Occurrences"));
         // the header is not a body property of the request type
-        assertTrue(SpecSketchGenerator.generateYaml(lines, "withBody").contains("in: header"));
+        assertTrue(yamlOf(lines, "withBody").contains("in: header"));
     }
 
     @Test
@@ -943,7 +949,7 @@ class JavaSketchGeneratorTest {
         List<String> lines = sketch("annotated");
 
         assertTrue(text(lines).contains("    @X-Count (0 - 1) : int"));
-        assertTrue(SpecSketchGenerator.generateYaml(lines, "annotated").contains("X-Count:"));
+        assertTrue(yamlOf(lines, "annotated").contains("X-Count:"));
     }
 
     @Test
@@ -964,7 +970,7 @@ class JavaSketchGeneratorTest {
         assertTrue(sketch.contains("    @X-Required (1) : int"), sketch);       // @Header(required)
         assertTrue(sketch.contains("    @X-Optional (0 - 1) : int"), sketch);
 
-        String yaml = SpecSketchGenerator.generateYaml(lines, "openApiHeaders");
+        String yaml = yamlOf(lines, "openApiHeaders");
         assertTrue(yaml.contains("- name: X-Mandatory"));
         assertTrue(yaml.contains("X-Required:"));
     }
@@ -1029,10 +1035,57 @@ class JavaSketchGeneratorTest {
     void aHeaderOnlyRequestKeepsTheOperationAGet() {
         List<String> lines = sketch("headersOnly");
 
-        String yaml = SpecSketchGenerator.generateYaml(lines, "headersOnly");
+        String yaml = yamlOf(lines, "headersOnly");
         assertTrue(yaml.contains("get:"));
         assertFalse(yaml.contains("requestBody"));
         assertTrue(yaml.contains("- name: X-Trace"));
+    }
+
+    // --------------------------------------------------- the reusable entry point
+
+    @Test
+    void aConfigurationRunsTheGeneratorWithoutACommandLine(@TempDir java.nio.file.Path outputDir)
+            throws java.io.IOException {
+        JavaSketchGenerator.Configuration configuration = new JavaSketchGenerator.Configuration(
+                org.os890.sketch.petstore.PetResource.class, outputDir,
+                Map.of("createPet", org.os890.sketch.petstore.model.Pet.class.getName()), Map.of());
+
+        List<JavaSketchGenerator.GeneratedEndpoint> written =
+                JavaSketchGenerator.generate(configuration, messages);
+
+        assertEquals(4, written.size());
+        for (JavaSketchGenerator.GeneratedEndpoint endpoint : written) {
+            assertEquals(outputDir.resolve(endpoint.methodName() + ".sketch"), endpoint.sketchFile());
+            assertEquals(outputDir.resolve(endpoint.methodName() + ".yaml"), endpoint.yamlFile());
+            assertTrue(java.nio.file.Files.exists(endpoint.sketchFile()));
+            assertTrue(java.nio.file.Files.exists(endpoint.yamlFile()));
+            assertNotNull(endpoint.httpMethod());
+            assertNotNull(endpoint.path());
+        }
+        // and the command line is just one way to arrive at that configuration
+        assertEquals(configuration, JavaSketchGenerator.parseArguments(new String[] {
+                org.os890.sketch.petstore.PetResource.class.getName(), outputDir.toString(),
+                "--response", "createPet=" + org.os890.sketch.petstore.model.Pet.class.getName()}));
+    }
+
+    @Test
+    void aResourceWithoutEndpointsLeavesNoOutputDirectoryBehind(@TempDir java.nio.file.Path parent) {
+        java.nio.file.Path outputDir = parent.resolve("out");
+
+        assertThrows(JavaSketchGenerator.GeneratorException.class, () -> JavaSketchGenerator.generate(
+                new JavaSketchGenerator.Configuration(NoEndpoints.class, outputDir), messages));
+        assertFalse(java.nio.file.Files.exists(outputDir));
+    }
+
+    @Test
+    void argumentsAreRejectedBeforeAnythingIsGenerated() {
+        assertThrows(JavaSketchGenerator.GeneratorException.class,
+                () -> JavaSketchGenerator.parseArguments(new String[] {"only-one-argument"}));
+        JavaSketchGenerator.GeneratorException missing = assertThrows(
+                JavaSketchGenerator.GeneratorException.class,
+                () -> JavaSketchGenerator.parseArguments(new String[] {"no.such.Resource", "out"}));
+        assertTrue(missing.getMessage().contains("class not found: no.such.Resource"),
+                () -> "unexpected message: " + missing.getMessage());
     }
 
     // ------------------------------------------------------- the demo resource
@@ -1048,7 +1101,7 @@ class JavaSketchGeneratorTest {
         assertEquals(4, endpoints.size());
         for (JavaSketchGenerator.Endpoint endpoint : endpoints) {
             List<String> lines = JavaSketchGenerator.toSketch(endpoint, collected);
-            assertProcessableOpenApi(SpecSketchGenerator.generateYaml(lines, endpoint.methodName()));
+            assertProcessableOpenApi(yamlOf(lines, endpoint.methodName()));
         }
     }
 

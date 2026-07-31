@@ -25,6 +25,12 @@ request (1) : PlaceOrderRequest                     // request body present -> P
     @X-Client-Id (1) : uuid                         // '@' = HTTP header (in: header parameter), not body
     @X-Feature-Flags (0 - *) : string               // repeatable custom header
     @Accept-Language (0 - 1) : string               // standard headers work the same way
+    {customerId} (1) : uuid                         // '{...}' = path parameter -> appended to the path
+    ?dryRun (0 - 1) : boolean                       // '?' = query parameter
+    ?channel (0 - *) : enum:String [WEB, APP]       // repeatable query parameter, inline enum
+    $cookie:session (0 - 1) : uuid                  // the long form names any location
+    $couponSource (0 - 1) : string                  // '$' alone: a parameter, location undecided
+                                                    // -> emitted as 'in: query' AND reported
     customerId (1) : uuid
     shippingAddress (1) : Address                   // forward reference - defined in the response part
     items (1 - *) : OrderItem                       /* at least one item */

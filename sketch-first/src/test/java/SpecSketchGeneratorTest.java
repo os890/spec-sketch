@@ -50,7 +50,12 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 class SpecSketchGeneratorTest {
 
     private static String generate(String... specLines) {
-        String yaml = SpecSketchGenerator.generateYaml(List.of(specLines), "sample");
+        return generate(new ArrayList<>(), specLines);
+    }
+
+    /** For the cases that assert what the translation decided on the sketch's behalf. */
+    private static String generate(List<String> messages, String... specLines) {
+        String yaml = SpecSketchGenerator.generateYaml(List.of(specLines), "sample", messages);
         assertProcessableOpenApi(yaml);
         return yaml;
     }
@@ -123,6 +128,18 @@ class SpecSketchGeneratorTest {
 
     private static String property(String yaml, String name) {
         return block(yaml, name, 8);
+    }
+
+    /** The single path key of the document, unquoted - a path template needs the quotes. */
+    private static String pathOf(String yaml) {
+        String first = block(yaml, "paths", 0).split("\n")[0].trim();
+        String key = first.substring(0, first.lastIndexOf(':'));
+        return key.startsWith("'") ? key.substring(1, key.length() - 1) : key;
+    }
+
+    private static void assertMessage(List<String> messages, String fragment) {
+        assertTrue(messages.stream().anyMatch(message -> message.contains(fragment)),
+                () -> "expected a message containing '" + fragment + "' but got: " + messages);
     }
 
     // ------------------------------------------------------ request / response
@@ -429,6 +446,236 @@ class SpecSketchGeneratorTest {
                 "response (1) : Res",
                 "    nested (1) : Inner",
                 "        @X-Too-Deep (1) : string"), "only allowed directly below");
+    }
+
+    // ----------------------------------------------------------- parameters
+
+    @Test
+    void queryParametersBecomeQueryParametersAndStayOutOfTheBody() {
+        String yaml = generate(
+                "request (1) : Req",
+                "    ?status (0 - 1) : enum Status [OPEN, DONE]",
+                "    ?tag (0 - *) : string",
+                "    ?page (0 - 1) : int {min: 1}",
+                "    name (1) : string",
+                "response (1) : Res",
+                "    ok (1) : boolean");
+
+        String parameters = block(yaml, "parameters", 6);
+        assertTrue(parameters.contains("- name: status"));
+        assertTrue(parameters.contains("in: query"));
+        assertTrue(parameters.contains("'#/components/schemas/Status'"));
+        // repeatable -> array schema, and the attribute block works as on any other line
+        assertTrue(parameters.contains("- name: tag"));
+        assertTrue(parameters.contains("type: array"));
+        assertTrue(parameters.contains("minimum: 1"));
+        // optional -> no required flag anywhere in the parameter list
+        assertFalse(parameters.contains("required: true"));
+
+        // a parameter is not a body property
+        String req = schema(yaml, "Req");
+        assertTrue(req.contains("name"));
+        assertFalse(req.contains("status"));
+        assertFalse(req.contains("page"));
+    }
+
+    @Test
+    void pathParametersAreAppendedToTheDerivedPath() {
+        List<String> messages = new ArrayList<>();
+        String yaml = generate(messages,
+                "request (1) : Req",
+                "    {petId} (1) : long",
+                "    {tagId} (1) : uuid",
+                "response (1) : Res",
+                "    ok (1) : boolean");
+
+        // 'in: path' is only valid for a name the path template really contains
+        assertTrue(yaml.contains("'/sample/{petId}/{tagId}':"), () -> yaml);
+        String parameters = block(yaml, "parameters", 6);
+        assertTrue(parameters.contains("- name: petId"));
+        assertTrue(parameters.contains("in: path"));
+        assertTrue(parameters.contains("required: true"));
+        assertTrue(parameters.contains("format: int64"));
+        assertMessage(messages, "derived from the file name plus one segment per path parameter");
+        assertMessage(messages, "'/sample/{petId}/{tagId}'");
+    }
+
+    @Test
+    void anUndecidedParameterBecomesAQueryParameterAndIsReported() {
+        // '$name' is the draft form: the sketch says 'this is a parameter' and leaves the location
+        // open, but OpenAPI has no 'in' for that - so the guess is made explicit instead of silent
+        List<String> messages = new ArrayList<>();
+        String yaml = generate(messages,
+                "request (1) : Req",
+                "    $petId (1) : long",
+                "response (1) : Res",
+                "    ok (1) : boolean");
+
+        String parameters = block(yaml, "parameters", 6);
+        assertTrue(parameters.contains("- name: petId"));
+        assertTrue(parameters.contains("in: query"));
+        assertTrue(parameters.contains("required: true"));
+        assertEquals("/sample", pathOf(yaml)); // undecided means untemplated
+        assertMessage(messages, "parameter '$petId' does not say where it comes from");
+        assertMessage(messages, "emitted as 'in: query'");
+        assertMessage(messages, "write '?petId' to keep it, or '{petId}' for a path parameter");
+    }
+
+    @Test
+    void everyLocationHasALongFormAndTheSugarIsEquivalent() {
+        String longForm = generate(
+                "request (1) : Req",
+                "    $path:petId (1) : long",
+                "    $query:status (0 - 1) : string",
+                "    $header:X-Client-Id (1) : uuid",
+                "    $cookie:session (0 - 1) : uuid",
+                "response (1) : Res",
+                "    ok (1) : boolean");
+
+        String parameters = block(longForm, "parameters", 6);
+        assertTrue(parameters.contains("in: path"));
+        assertTrue(parameters.contains("in: query"));
+        assertTrue(parameters.contains("in: header"));
+        assertTrue(parameters.contains("in: cookie"));
+        assertTrue(parameters.contains("- name: X-Client-Id"));
+
+        // '{petId}' / '?status' / '@X-Client-Id' are shorthand for three of them
+        String sugared = generate(
+                "request (1) : Req",
+                "    {petId} (1) : long",
+                "    ?status (0 - 1) : string",
+                "    @X-Client-Id (1) : uuid",
+                "    $cookie:session (0 - 1) : uuid",
+                "response (1) : Res",
+                "    ok (1) : boolean");
+        assertEquals(longForm, sugared);
+    }
+
+    @Test
+    void parameterOnlyRequestHasNoBodyAndStaysGet() {
+        String yaml = generate(
+                "request (1) : Probe",
+                "    {petId} (1) : long",
+                "    ?verbose (0 - 1) : boolean",
+                "response (1) : Res",
+                "    ok (1) : boolean");
+
+        assertTrue(yaml.contains("get:"));
+        assertFalse(yaml.contains("requestBody"));
+        assertFalse(yaml.contains("Probe")); // the request type stays unused, like for headers only
+    }
+
+    @Test
+    void parametersKeepDeclarationOrderAlongsideARequestBody() {
+        // a POST may carry parameters too; the emitted order is the order the sketch declares
+        String yaml = generate(
+                "request (1) : Req",
+                "    ?dryRun (0 - 1) : boolean",
+                "    @X-Client-Id (1) : uuid",
+                "    {petId} (1) : long",
+                "    name (1) : string",
+                "response (1) : Res",
+                "    ok (1) : boolean");
+
+        assertTrue(yaml.contains("post:"));
+        assertTrue(yaml.contains("requestBody"));
+        String parameters = block(yaml, "parameters", 6);
+        assertTrue(parameters.indexOf("- name: dryRun") < parameters.indexOf("- name: X-Client-Id"));
+        assertTrue(parameters.indexOf("- name: X-Client-Id") < parameters.indexOf("- name: petId"));
+        assertEquals("/sample/{petId}", pathOf(yaml));
+    }
+
+    @Test
+    void pathParametersMustBeRequiredSingleAndScalar() {
+        // the value sits in the URL itself: it cannot be absent, cannot repeat, and an object has
+        // no serialization in a path segment
+        assertSpecFailure(() -> generate(
+                "request (1) : Req",
+                "    {petId} (0 - 1) : long",
+                "response (1) : Res",
+                "    ok (1) : boolean"), "path parameter '{petId}' cannot be optional");
+        assertSpecFailure(() -> generate(
+                "request (1) : Req",
+                "    {petId} (1 - *) : long",
+                "response (1) : Res",
+                "    ok (1) : boolean"), "path parameter '{petId}' cannot be repeated");
+        assertSpecFailure(() -> generate(
+                "request (1) : Req",
+                "    {filter} (1) : Filter",
+                "response (1) : Res",
+                "    ok (1) : boolean",
+                "Filter (1) : Filter",
+                "    q (1) : string"), "cannot carry the object type 'Filter'");
+        // an enum is fine: it is a string on the wire
+        assertTrue(generate(
+                "request (1) : Req",
+                "    {status} (1) : enum Status [OPEN, DONE]",
+                "response (1) : Res",
+                "    ok (1) : boolean").contains("in: path"));
+    }
+
+    @Test
+    void parametersAreOnlyAllowedDirectlyBelowRequest() {
+        // a response has no query/path/cookie parameters - only headers
+        assertSpecFailure(() -> generate(
+                "response (1) : Res",
+                "    ?status (0 - 1) : string",
+                "    ok (1) : boolean"), "parameter '?status' is only allowed directly below 'request'");
+        assertSpecFailure(() -> generate(
+                "{petId} (1) : long",
+                "response (1) : Res",
+                "    ok (1) : boolean"), "parameter '{petId}' is only allowed directly below 'request'");
+        assertSpecFailure(() -> generate(
+                "response (1) : Res",
+                "    nested (1) : Inner",
+                "        $petId (1) : long"), "parameter '$petId' is only allowed directly below 'request'");
+    }
+
+    @Test
+    void duplicateParametersAreRejectedPerLocation() {
+        assertSpecFailure(() -> generate(
+                "request (1) : Req",
+                "    ?status (0 - 1) : string",
+                "    ?status (0 - 1) : int",
+                "response (1) : Res",
+                "    ok (1) : boolean"), "duplicate query parameter '?status' (already declared at line 2)");
+        // the undecided form resolves to a query parameter first, so it collides with one
+        assertSpecFailure(() -> generate(
+                "request (1) : Req",
+                "    ?status (0 - 1) : string",
+                "    $status (0 - 1) : string",
+                "response (1) : Res",
+                "    ok (1) : boolean"), "duplicate query parameter '$status' (already declared at line 2)");
+        // two locations may share a name: they are distinct parameters for OpenAPI
+        String yaml = generate(
+                "request (1) : Req",
+                "    {id} (1) : long",
+                "    ?id (0 - 1) : long",
+                "response (1) : Res",
+                "    ok (1) : boolean");
+        assertTrue(block(yaml, "parameters", 6).contains("in: path"));
+        assertTrue(block(yaml, "parameters", 6).contains("in: query"));
+    }
+
+    @Test
+    void unknownParameterLocationIsRejected() {
+        assertSpecFailure(() -> generate(
+                "request (1) : Req",
+                "    $body:petId (1) : long",
+                "response (1) : Res",
+                "    ok (1) : boolean"), "unknown parameter location 'body'");
+    }
+
+    @Test
+    void aParameterCannotBeADiscriminator() {
+        assertSpecFailure(() -> generate(
+                "request (1) : Req",
+                "    ?kind (1) : discriminator",
+                "    name (1) : string",
+                "    extended by Sub",
+                "        x (1) : int",
+                "response (1) : Res",
+                "    ok (1) : boolean"), "a parameter cannot be a discriminator");
     }
 
     // ------------------------------------------------------------- comments
@@ -1356,7 +1603,7 @@ class SpecSketchGeneratorTest {
     void aUtf8BomOnTheFirstLineIsIgnored() {
         // editors on Windows like to add one, and it made line 1 unparseable
         String yaml = SpecSketchGenerator.generateYaml(
-                List.of("﻿response (1) : Res", "    x (1) : string"), "sample");
+                List.of("﻿response (1) : Res", "    x (1) : string"), "sample", new ArrayList<>());
 
         assertProcessableOpenApi(yaml);
         assertTrue(schema(yaml, "Res").contains("x"));

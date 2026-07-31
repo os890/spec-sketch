@@ -194,6 +194,30 @@ Rules:
   contains only headers has no body and stays a GET, so header definitions work without
   forcing a POST. Header names must be unique per part — HTTP header names are
   case-insensitive, so `@X-Id` and `@x-id` count as the same header.
+- **Parameters:** direct children of `request` may carry the other parameter sigils, and **saying
+  where a parameter comes from is optional** — a first sketch can state that an operation takes a
+  `petId` before the URL shape is settled:
+  ```
+  request (1) : GetPetParams
+      $petId (1) : long                 // a parameter — the location is not decided yet
+      $path:petId (1) : long            // decided later: a path parameter
+      $query:status (0 - 1) : PetStatus
+      $cookie:session (0 - 1) : uuid
+      $header:X-Client-Id (1) : uuid    // the long form of '@X-Client-Id'
+  ```
+  `?name` is shorthand for `$query:name` and `{name}` for `$path:name`, so the two common cases
+  read like the URL they end up in (`?status (0 - 1) : PetStatus`, `{petId} (1) : long`).
+  Refining a draft is a pure prefix edit — `$petId` → `{petId}` — nothing else on the line moves.
+  OpenAPI has no `in` value for "not decided", so an undecided `$name` is emitted as a query
+  parameter **and reported**: the document stays usable, the guess never stays silent. Occurrence,
+  types and attributes work exactly as on headers, and parameters are never body properties, so a
+  request of parameters alone has no body and stays a GET. Names must be unique per location
+  (`{id}` and `?id` are two distinct parameters). `in: path` is the one location OpenAPI
+  constrains: it must be required (`(1)`), cannot repeat, cannot carry an object type, and its
+  name has to appear in the path template — which is derived from the file name, so path
+  parameters are appended to it in declaration order (`getPet` + `{petId}` → `/getPet/{petId}`).
+  Where those segments really sit in the URL is not expressible yet, so the derived path is
+  reported as the guess it is.
 - **Imports:** a top-level `import <TypeName>` declares a type whose details already live in a
   shared/common yaml file — no local schema is generated; every usage becomes an external
   `$ref` with a type-specific placeholder to be filled in:
@@ -225,9 +249,9 @@ Rules:
   (`{pattern: "^#[0-9a-f]{6}$"}`, `import Money from "https://…/common.yaml"`). Comment-only
   lines are ignored at *any* indentation, so they never affect the nesting. Blank lines are
   ignored as well.
-- Errors (broken indentation, undefined types, conflicting redefinitions, duplicate property or
-  header names, attributes on a type that cannot carry them) are reported with line numbers and
-  fail the build — the guiding rule is that a sketch either fails with a line number or yields
+- Errors (broken indentation, undefined types, conflicting redefinitions, duplicate property,
+  header or parameter names, attributes on a type that cannot carry them) are reported with line
+  numbers and fail the build — the guiding rule is that a sketch either fails with a line number or yields
   an OpenAPI document the toolchain accepts, never a silently wrong one.
 
 The translation itself is covered by
@@ -458,9 +482,10 @@ per file), side by side under `src/main/sketch/`, both under version control.
   request header lines, `@APIResponse(headers = @Header(…))` become response header lines. A
   header is required when `@NotNull`, `@Parameter(required = true)` or `@Header(required = true)`
   says so.
-- **Everything the DSL cannot express yet is reported, never dropped silently**: path and query
-  parameters, non-200 responses, `Map` and `byte[]` members, and the fact that the yaml path is
-  derived from the file name rather than from `@Path`.
+- **Everything this generator does not map yet is reported, never dropped silently**: path, query,
+  cookie, form and `@BeanParam` parameters (the DSL grew sigils for the first three, the Java side
+  is not wired to them yet), non-200 responses, `Map` and `byte[]` members, and the fact that the
+  yaml path is derived from the file name rather than from `@Path`.
 
 Run it standalone against any resource class:
 
@@ -469,6 +494,22 @@ java -cp "code-first/target/classes:$(cat cp.txt)" JavaSketchGenerator \
   org.os890.sketch.petstore.PetResource ./out \
   --response createPet=org.os890.sketch.petstore.model.Pet
 ```
+
+The command line is only the outermost layer. `main` parses the arguments into a `Configuration`
+with every value already resolved, and `generate` runs on that — so anything holding those values
+(a build plugin, another generator, a test) reuses the generator directly instead of formatting a
+`String[]`:
+
+```java
+var messages = new ArrayList<String>();
+var written = JavaSketchGenerator.generate(
+        new JavaSketchGenerator.Configuration(PetResource.class, Path.of("out")), messages);
+// written: one GeneratedEndpoint (method, HTTP method, path, sketch file, yaml file) per endpoint
+```
+
+Only `main` reads arguments, prints and sets exit codes (`2` for a wrong invocation, `1` for a
+rejected model). `generate` reports through `messages`, returns what it wrote, and throws when
+something cannot be expressed correctly.
 
 `code-first` deliberately stops at the spec: it already has the Java classes, so generating DTOs
 from its own output would be circular. [`JavaSketchGeneratorTest`](code-first/src/test/java/JavaSketchGeneratorTest.java)

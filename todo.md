@@ -31,9 +31,11 @@ functionality. Grouped by the direction they would take the project.
   operation on one path derived from the file name. Real APIs need several
   endpoints (CRUD) with explicit paths and HTTP methods. The big-ticket
   structural item; foundation for the two below.
-- [ ] **Path and query parameters** — headers exist (`@`), but there is no
-  `/pets/{petId}` path parameter or `?status=` query parameter support yet
-  (could follow the header pattern with sigils).
+- [x] **Path and query parameters** — done: `{petId}`, `?status`, `$cookie:sid` and
+  the location-agnostic draft form `$petId` (emitted as `in: query` and reported).
+  What is still missing is *where* a path parameter sits: the template is the file
+  name plus one appended segment per path parameter, so `/pets/{petId}/shipments`
+  is out of reach until the two items below land.
 - [ ] **Error responses / status codes** — only a `200` response today; the
   yaml-first spec defines `400`/`404` with an `ApiError` body, so the
   SpecSketch petstore is not yet expressively equal.
@@ -46,8 +48,20 @@ functionality. Grouped by the direction they would take the project.
 Everything below is a consequence of the DSL gaps above: the Java model states it,
 `JavaSketchGenerator` reports it, but there is no sketch syntax to carry it.
 
-- [ ] **Path and query parameters** — `@PathParam`/`@QueryParam` are reported and dropped;
-  they need the DSL sigils first.
+- [ ] **Path and query parameters** — the DSL sigils exist now (`{petId}`, `?status`,
+  `$cookie:sid`, `$petId`), but `JavaSketchGenerator` still reports and drops
+  `@PathParam`/`@QueryParam`/`@CookieParam`; mapping them onto the sigils is the next step.
+- [ ] **`@BeanParam` trees** — a `@BeanParam` POJO is dropped as one opaque unit, so nothing
+  inside it is seen: no nested `@BeanParam` layer, and no `@QueryParam`/`@PathParam`/
+  `@HeaderParam` member at any depth — a header carried inside such a tree is lost even
+  though the DSL can express it. The members may also sit on accessors or constructor
+  parameters rather than fields, and `@DefaultValue` means the server fills the value in.
+- [ ] **`@FormParam` is a body, not a parameter** — on a `@POST` a `@BeanParam` tree may carry
+  `@FormParam` members (or `@RestForm`/`@MultipartForm`), which belong in the request *body* as
+  `application/x-www-form-urlencoded`/`multipart/form-data`. Because the body is detected as
+  "the parameter carrying no JAX-RS annotation", such a POST currently comes out with no
+  request body at all. Emitting it needs the content-type item under "Metadata control"
+  (and the binary item for file parts).
 - [ ] **Error responses** — only the 2xx payload is emitted; a resource's 404/400
   bodies have no place in a one-operation sketch.
 - [ ] **The real HTTP path** — the yaml path comes from the sketch file name

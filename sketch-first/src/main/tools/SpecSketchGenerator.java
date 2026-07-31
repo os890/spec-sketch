@@ -100,6 +100,30 @@ import java.util.regex.Pattern;
  * Header names must be unique per part (HTTP header names are case-insensitive).
  * Additional top-level lines may define further reusable types.
  *
+ * Parameters: direct children of 'request' may also carry the other parameter
+ * sigils. Saying where a parameter comes from is OPTIONAL, so a first sketch can
+ * state that an operation takes a 'petId' before the URL shape is settled:
+ *     $petId (1) : long                // a parameter - location not decided yet
+ *     $path:petId (1) : long           // decided later: a path parameter
+ *     $query:status (0 - 1) : PetStatus
+ *     $cookie:session (0 - 1) : uuid
+ *     $header:X-Client-Id (1) : uuid   // the long form of '@X-Client-Id'
+ * '?name' is shorthand for '$query:name' and '{name}' for '$path:name', so the
+ * two common cases read like the URL they end up in:
+ *     ?status (0 - 1) : PetStatus
+ *     {petId} (1) : long
+ * OpenAPI has no 'in' value for 'not decided', so an undecided '$name' is
+ * emitted as a query parameter and reported - the document stays usable and the
+ * guess never stays silent. Occurrence, types and attributes work as on headers;
+ * parameters are never body properties, so a request of parameters alone has no
+ * body and stays a GET. Names must be unique per location (a path and a query
+ * parameter may share one). 'in: path' is the single location OpenAPI
+ * constrains: it must be required ((1)), cannot repeat, cannot carry an object
+ * type, and its name has to appear in the path template - which is derived from
+ * the file name, so path parameters are appended to it in declaration order
+ * ('getPet' + '{petId}' -> '/getPet/{petId}'). Where the segments really sit in
+ * the URL is not expressible yet, so the derived path is reported.
+ *
  * Imports: a top-level line 'import <TypeName>' declares a type whose details
  * live in an existing shared/common yaml file - no local schema is generated,
  * every usage becomes an external $ref with a type-specific placeholder meant
@@ -159,8 +183,17 @@ public final class SpecSketchGenerator {
     private static final Pattern IMPORT_LINE = Pattern.compile(
             "import\\s+([A-Za-z_][A-Za-z0-9_]*)(?:\\s+from\\s+\"([^\"]+)\")?");
 
+    private static final String NAME = "[A-Za-z_][A-Za-z0-9_-]*";
+
+    /**
+     * A line's name, optionally carrying a parameter sigil: '@' header, '?' query, '{...}' path,
+     * '$' a parameter whose location is undecided, '$&lt;location&gt;:' an explicit one. No capturing
+     * group, so the group numbers of {@link #LINE} stay as they read.
+     */
+    private static final String SIGIL_NAME = "(?:[@?]|\\$(?:[A-Za-z]+:)?)?" + NAME + "|\\{" + NAME + "\\}";
+
     private static final Pattern LINE = Pattern.compile(
-            "(@?[A-Za-z_][A-Za-z0-9_-]*)\\s*\\(\\s*(\\d+)\\s*(?:-\\s*(\\d+|\\*)\\s*)?\\)\\s*:\\s*([A-Za-z_][A-Za-z0-9_]*)(?:\\s*:\\s*([A-Za-z_][A-Za-z0-9_]*))?(?:\\s+([A-Za-z_][A-Za-z0-9_]*))?\\s*(?:\\[([^\\]]*)\\])?\\s*(?:\\{(.*)\\})?");
+            "(" + SIGIL_NAME + ")\\s*\\(\\s*(\\d+)\\s*(?:-\\s*(\\d+|\\*)\\s*)?\\)\\s*:\\s*([A-Za-z_][A-Za-z0-9_]*)(?:\\s*:\\s*([A-Za-z_][A-Za-z0-9_]*))?(?:\\s+([A-Za-z_][A-Za-z0-9_]*))?\\s*(?:\\[([^\\]]*)\\])?\\s*(?:\\{(.*)\\})?");
 
     private static final Map<String, Map<String, Object>> BUILT_INS = builtInTypes();
 
@@ -204,10 +237,35 @@ public final class SpecSketchGenerator {
         return m;
     }
 
+    /**
+     * Where a parameter line lands in the document. UNSPECIFIED is the draft form '$name': the
+     * sketch says 'this is a parameter' without deciding where it comes from. OpenAPI has no 'in'
+     * value for that, so it is resolved to QUERY (and reported) before anything is emitted - which
+     * is why {@link #wireName()} is never called on it.
+     */
+    private enum ParamIn {
+        PATH, QUERY, HEADER, COOKIE, UNSPECIFIED;
+
+        /** The OpenAPI 'in' value. */
+        String wireName() {
+            return name().toLowerCase();
+        }
+
+        /** The location named by a '$&lt;location&gt;:' prefix, or null if the word is not one. */
+        static ParamIn of(String word) {
+            for (ParamIn location : List.of(PATH, QUERY, HEADER, COOKIE)) {
+                if (location.wireName().equals(word)) {
+                    return location;
+                }
+            }
+            return null;
+        }
+    }
+
     private static final class Node {
         final int lineNo;
         final String name;
-        final boolean isHeader;        // name started with '@'
+        final ParamIn location;        // null -> a body property; otherwise the parameter sigil
         final boolean isSubtypeMarker; // an 'extended by <SubType>' line; type holds the subtype name
         final boolean isImport;        // an 'import <TypeName>' line; type holds the imported name
         final String importPath;       // the optional 'from "..."' path; null -> placeholder ref
@@ -220,12 +278,12 @@ public final class SpecSketchGenerator {
         final Map<String, Object> attributes; // null unless the line carries a {...} block
         final List<Node> children = new ArrayList<>();
 
-        Node(int lineNo, String name, boolean isHeader, boolean isSubtypeMarker,
+        Node(int lineNo, String name, ParamIn location, boolean isSubtypeMarker,
              boolean isImport, String importPath, int min, int max, String type,
              String enumValueType, String enumName, List<Object> enumValues, Map<String, Object> attributes) {
             this.lineNo = lineNo;
             this.name = name;
-            this.isHeader = isHeader;
+            this.location = location;
             this.isSubtypeMarker = isSubtypeMarker;
             this.isImport = isImport;
             this.importPath = importPath;
@@ -240,6 +298,29 @@ public final class SpecSketchGenerator {
 
         boolean isArray() {
             return max == UNBOUNDED || max > 1;
+        }
+
+        boolean isHeader() {
+            return location == ParamIn.HEADER;
+        }
+
+        /** Any parameter line: a header or one of the other locations - never a body property. */
+        boolean isParameter() {
+            return location != null;
+        }
+
+        /** The name as it reads in a sketch, so a message quotes the line it is about. */
+        String sigilName() {
+            if (location == null) {
+                return name;
+            }
+            return switch (location) {
+                case HEADER -> "@" + name;
+                case PATH -> "{" + name + "}";
+                case QUERY -> "?" + name;
+                case COOKIE -> "$cookie:" + name;
+                case UNSPECIFIED -> "$" + name;
+            };
         }
     }
 
@@ -261,7 +342,11 @@ public final class SpecSketchGenerator {
                 throw new SpecException(Files.exists(input) ? "input file is not readable" : "input file not found");
             }
             if (args.length == 2 && args[1].equals("-")) {
-                System.out.print(generateYaml(Files.readAllLines(input), baseNameOf(input)));
+                List<String> messages = new ArrayList<>();
+                System.out.print(generateYaml(Files.readAllLines(input), baseNameOf(input), messages));
+                for (String message : messages) {
+                    System.err.println("SpecSketchGenerator: " + message);
+                }
                 return;
             }
             // default: save the YAML in the same path as the input file
@@ -313,16 +398,21 @@ public final class SpecSketchGenerator {
         List<String> lines = Files.readAllLines(input);
         String existing = Files.exists(output) ? Files.readString(output) : null;
 
-        String yaml = generateYaml(rebaseImportPaths(lines, sketchDir, outputDir), baseNameOf(input));
+        // the translation may run twice (adopting import paths re-reads the sketch); its messages
+        // describe the sketch as it stands, so only those of the run that produced the yaml count
+        List<String> translated = new ArrayList<>();
+        String yaml = generateYaml(rebaseImportPaths(lines, sketchDir, outputDir), baseNameOf(input), translated);
         if (existing != null) {
             Map<String, String> resolved = resolvedImportPaths(existing, yaml);
             if (!resolved.isEmpty()) {
                 List<String> updated = applyImportPaths(lines, resolved, outputDir, sketchDir, messages);
                 Files.write(input, updated);
                 lines = updated;
-                yaml = generateYaml(rebaseImportPaths(lines, sketchDir, outputDir), baseNameOf(input));
+                translated.clear();
+                yaml = generateYaml(rebaseImportPaths(lines, sketchDir, outputDir), baseNameOf(input), translated);
             }
         }
+        messages.addAll(translated);
         warnAboutPathlessImports(lines, messages);
         if (yaml.equals(existing)) {
             messages.add(output + " is already up to date");
@@ -450,13 +540,17 @@ public final class SpecSketchGenerator {
         return raw.substring(0, afterType) + " from \"" + path + "\"" + raw.substring(afterType);
     }
 
-    /** Entry point for tests and for {@link #main}: SpecSketch lines in, OpenAPI YAML out. */
-    static String generateYaml(List<String> lines, String baseName) {
+    /**
+     * Entry point for tests and for {@link #main}: SpecSketch lines in, OpenAPI YAML out.
+     * {@code messages} collects what the translation decided on the sketch's behalf - a parameter
+     * whose location was left open, and the path template derived for path parameters.
+     */
+    static String generateYaml(List<String> lines, String baseName, List<String> messages) {
         List<Node> roots = parse(lines);
         if (roots.isEmpty()) {
             throw new SpecException("no definitions found");
         }
-        return generate(roots, baseName);
+        return generate(roots, baseName, messages);
     }
 
     // ---------------------------------------------------------------- parsing
@@ -561,13 +655,13 @@ public final class SpecSketchGenerator {
         Matcher importMatcher = IMPORT_LINE.matcher(body);
         if (importMatcher.matches()) {
             String importedType = importMatcher.group(1);
-            return new Node(lineNo, importedType, false, false, true, importMatcher.group(2),
+            return new Node(lineNo, importedType, null, false, true, importMatcher.group(2),
                     1, 1, importedType, null, null, null, null);
         }
         Matcher extendedByMatcher = EXTENDED_BY_LINE.matcher(body);
         if (extendedByMatcher.matches()) {
             String subType = extendedByMatcher.group(1);
-            return new Node(lineNo, subType, false, true, false, null, 1, 1, subType, null, null, null, null);
+            return new Node(lineNo, subType, null, true, false, null, 1, 1, subType, null, null, null, null);
         }
         Matcher m = LINE.matcher(body);
         if (!m.matches()) {
@@ -593,9 +687,47 @@ public final class SpecSketchGenerator {
         String enumValueType = enumValues == null ? null : valueType == null ? "string" : valueType;
         Map<String, Object> attributes = parseAttributes(type, enumValues != null, m.group(8), lineNo);
         String rawName = m.group(1);
-        boolean isHeader = rawName.startsWith("@");
-        return new Node(lineNo, isHeader ? rawName.substring(1) : rawName, isHeader, false, false, null,
+        return new Node(lineNo, nameOf(rawName), locationOf(rawName, lineNo), false, false, null,
                 min, max, type, enumValueType, enumName, enumValues, attributes);
+    }
+
+    /** The location a name's sigil states, or null when the line is a plain body property. */
+    private static ParamIn locationOf(String rawName, int lineNo) {
+        return switch (rawName.charAt(0)) {
+            case '@' -> ParamIn.HEADER;
+            case '?' -> ParamIn.QUERY;
+            case '{' -> ParamIn.PATH;
+            case '$' -> explicitLocationOf(rawName, lineNo);
+            default -> null;
+        };
+    }
+
+    /** '$name' leaves the location open; '$&lt;location&gt;:name' names one, and has to name a real one. */
+    private static ParamIn explicitLocationOf(String rawName, int lineNo) {
+        int colon = rawName.indexOf(':');
+        if (colon < 0) {
+            return ParamIn.UNSPECIFIED;
+        }
+        String word = rawName.substring(1, colon);
+        ParamIn location = ParamIn.of(word);
+        if (location == null) {
+            throw new SpecException("line " + lineNo + ": unknown parameter location '" + word
+                    + "' (supported: path, query, header, cookie; plain '$" + rawName.substring(colon + 1)
+                    + "' leaves the location undecided)");
+        }
+        return location;
+    }
+
+    /** The name without its sigil: '@X-Id', '?q', '{id}' and '$path:id' all carry a plain name. */
+    private static String nameOf(String rawName) {
+        if (rawName.charAt(0) == '{') {
+            return rawName.substring(1, rawName.length() - 1);
+        }
+        if ("@?$".indexOf(rawName.charAt(0)) < 0) {
+            return rawName;
+        }
+        int colon = rawName.indexOf(':');
+        return rawName.substring(colon < 0 ? 1 : colon + 1);
     }
 
     /** The regex only guarantees digits, so the single failure mode is an int overflow. */
@@ -829,7 +961,7 @@ public final class SpecSketchGenerator {
         final Map<String, Node> imports = new LinkedHashMap<>(); // imported name -> its 'import' line
     }
 
-    private static String generate(List<Node> roots, String baseName) {
+    private static String generate(List<Node> roots, String baseName, List<String> messages) {
         Registry registry = new Registry();
         collectImports(roots, registry);
 
@@ -854,9 +986,9 @@ public final class SpecSketchGenerator {
         if (response == null) {
             throw new SpecException("missing top-level 'response' definition");
         }
-        validateHeaderPlacement(roots, request, response);
+        validateParameterPlacement(roots, request, response);
 
-        // the request is the only part that may consist of headers alone (-> no body, no schema)
+        // the request is the only part that may consist of parameters alone (-> no body, no schema)
         for (Node root : roots) {
             if (!root.isImport) {
                 defineTypes(root, registry, root == request);
@@ -871,9 +1003,15 @@ public final class SpecSketchGenerator {
 
         Map<String, Map<String, Object>> schemas = registry.schemas;
         Map<String, Node> imports = registry.imports;
-        List<Node> requestHeaders = request == null ? List.of() : headerChildren(request);
+        List<Parameter> requestParameters = requestParameters(request, messages);
+        // the path parameter rules need the schemas, so they are checked once those are known
+        for (Parameter parameter : requestParameters) {
+            if (parameter.in() == ParamIn.PATH) {
+                validatePathParameter(parameter.node(), registry);
+            }
+        }
         List<Node> responseHeaders = headerChildren(response);
-        // a request whose children are all '@' headers has no body and stays a GET
+        // a request whose children are all parameters has no body and stays a GET
         boolean hasBody = request != null && (request.children.isEmpty() || !bodyChildren(request).isEmpty());
 
         Map<String, Object> okResponse = new LinkedHashMap<>();
@@ -896,17 +1034,18 @@ public final class SpecSketchGenerator {
         String method = hasBody ? "post" : "get";
         Map<String, Object> operation = new LinkedHashMap<>();
         operation.put("operationId", method + response.type);
-        if (!requestHeaders.isEmpty()) {
+        if (!requestParameters.isEmpty()) {
             List<Object> parameters = new ArrayList<>();
-            for (Node header : requestHeaders) {
-                Map<String, Object> parameter = new LinkedHashMap<>();
-                parameter.put("name", header.name);
-                parameter.put("in", "header");
-                if (header.min >= 1) {
-                    parameter.put("required", true);
+            for (Parameter parameter : requestParameters) {
+                Node node = parameter.node();
+                Map<String, Object> emitted = new LinkedHashMap<>();
+                emitted.put("name", node.name);
+                emitted.put("in", parameter.in().wireName());
+                if (node.min >= 1) {
+                    emitted.put("required", true);
                 }
-                parameter.put("schema", occurrenceSchema(header, imports));
-                parameters.add(parameter);
+                emitted.put("schema", occurrenceSchema(node, imports));
+                parameters.add(emitted);
             }
             operation.put("parameters", parameters);
         }
@@ -921,12 +1060,34 @@ public final class SpecSketchGenerator {
         Map<String, Object> doc = new LinkedHashMap<>();
         doc.put("openapi", "3.0.3");
         doc.put("info", map("title", baseName + " API (generated from SpecSketch)", "version", "1.0.0"));
-        doc.put("paths", map("/" + baseName, map(method, operation)));
+        doc.put("paths", map(operationPath(baseName, requestParameters, messages), map(method, operation)));
         doc.put("components", map("schemas", schemas));
 
         StringBuilder sb = new StringBuilder();
         emitMap(sb, doc, 0);
         return sb.toString();
+    }
+
+    /**
+     * The path key of the operation: derived from the file name, plus one templated segment per
+     * path parameter in declaration order - 'in: path' is only valid for a name the path template
+     * really contains. Where those segments sit in the real URL cannot be said in a sketch yet, so
+     * the derived path is reported rather than presented as the truth.
+     */
+    private static String operationPath(String baseName, List<Parameter> parameters, List<String> messages) {
+        StringBuilder path = new StringBuilder("/").append(baseName);
+        boolean templated = false;
+        for (Parameter parameter : parameters) {
+            if (parameter.in() == ParamIn.PATH) {
+                path.append("/{").append(parameter.node().name).append('}');
+                templated = true;
+            }
+        }
+        if (templated) {
+            messages.add("the operation path is derived from the file name plus one segment per path"
+                    + " parameter, in declaration order: '" + path + "'");
+        }
+        return path.toString();
     }
 
     private static void collectImports(List<Node> roots, Registry registry) {
@@ -950,37 +1111,115 @@ public final class SpecSketchGenerator {
     }
 
     /**
-     * The '@' headers of 'request'/'response'. Duplicates are rejected: two same-named header
-     * parameters make the document invalid, and two same-named response headers would silently
-     * collapse into one. HTTP header names are case-insensitive, so the check is too.
+     * The '@' headers of a part. Duplicates are rejected: two same-named header parameters make the
+     * document invalid, and two same-named response headers would silently collapse into one.
      */
     private static List<Node> headerChildren(Node node) {
         List<Node> headers = new ArrayList<>();
         Map<String, Node> seen = new LinkedHashMap<>();
         for (Node child : node.children) {
-            if (!child.isHeader) {
+            if (!child.isHeader()) {
                 continue;
             }
             Node first = seen.putIfAbsent(child.name.toLowerCase(), child);
             if (first != null) {
-                throw new SpecException("line " + child.lineNo + ": duplicate header '@" + child.name
-                        + "' (already declared at line " + first.lineNo
-                        + "; HTTP header names are case-insensitive)");
+                throw duplicateParameter(child, first, ParamIn.HEADER);
             }
             headers.add(child);
         }
         return headers;
     }
 
+    /** A request parameter with its location resolved - '$name' left it to the generator. */
+    private record Parameter(Node node, ParamIn in) {
+    }
+
+    /**
+     * The parameter lines of the request in declaration order, headers included: on the request
+     * side every one of them is an entry of the operation's 'parameters' list, and keeping them in
+     * one list keeps a mixed sketch emitting them in the order it declares them.
+     *
+     * A location left open resolves to 'query' here, which is the point where the guess is
+     * reported. Names have to be unique per location - '{id}' and '?id' are two distinct
+     * parameters for OpenAPI - and header names are compared case-insensitively, as HTTP does.
+     */
+    private static List<Parameter> requestParameters(Node request, List<String> messages) {
+        List<Parameter> parameters = new ArrayList<>();
+        if (request == null) {
+            return parameters;
+        }
+        Map<String, Node> seen = new LinkedHashMap<>();
+        for (Node child : request.children) {
+            if (!child.isParameter()) {
+                continue;
+            }
+            ParamIn in = child.location;
+            if (in == ParamIn.UNSPECIFIED) {
+                in = ParamIn.QUERY;
+                messages.add("warning: line " + child.lineNo + ": parameter '$" + child.name
+                        + "' does not say where it comes from and was emitted as 'in: query'"
+                        + " - write '?" + child.name + "' to keep it, or '{" + child.name
+                        + "}' for a path parameter");
+            }
+            String key = in.wireName() + " "
+                    + (in == ParamIn.HEADER ? child.name.toLowerCase() : child.name);
+            Node first = seen.putIfAbsent(key, child);
+            if (first != null) {
+                throw duplicateParameter(child, first, in);
+            }
+            parameters.add(new Parameter(child, in));
+        }
+        return parameters;
+    }
+
+    private static SpecException duplicateParameter(Node duplicate, Node first, ParamIn in) {
+        if (in == ParamIn.HEADER) {
+            return new SpecException("line " + duplicate.lineNo + ": duplicate header '@" + duplicate.name
+                    + "' (already declared at line " + first.lineNo
+                    + "; HTTP header names are case-insensitive)");
+        }
+        return new SpecException("line " + duplicate.lineNo + ": duplicate " + in.wireName()
+                + " parameter '" + duplicate.sigilName() + "' (already declared at line "
+                + first.lineNo + ")");
+    }
+
+    /**
+     * 'in: path' is the one location OpenAPI constrains: the value sits in the URL itself, so it is
+     * always required, appears exactly once, and has no serialization for an object.
+     */
+    private static void validatePathParameter(Node node, Registry registry) {
+        String name = "'{" + node.name + "}'";
+        if (node.min < 1) {
+            throw new SpecException("line " + node.lineNo + ": path parameter " + name
+                    + " cannot be optional - it is part of the URL, so its occurrence must be (1)");
+        }
+        if (node.isArray()) {
+            throw new SpecException("line " + node.lineNo + ": path parameter " + name
+                    + " cannot be repeated - one URL segment carries one value");
+        }
+        if (node.enumValues != null || node.enumName != null
+                || BUILT_INS.containsKey(node.type.toLowerCase())) {
+            return;
+        }
+        Map<String, Object> schema = registry.schemas.get(node.type);
+        boolean object = !node.children.isEmpty()
+                || (schema != null && (schema.containsKey("properties") || schema.containsKey("allOf")));
+        if (object) {
+            throw new SpecException("line " + node.lineNo + ": path parameter " + name
+                    + " cannot carry the object type '" + node.type + "' - a URL segment has no"
+                    + " serialization for it (use a built-in type or an enum)");
+        }
+    }
+
     private static String indentedBelow(Node node) {
         return " (line " + node.children.get(0).lineNo + " is indented below it)";
     }
 
-    /** The children that become body properties: neither '@' headers nor 'extended by' markers. */
+    /** The children that become body properties: neither parameters nor 'extended by' markers. */
     private static List<Node> bodyChildren(Node node) {
         List<Node> body = new ArrayList<>();
         for (Node child : node.children) {
-            if (!child.isHeader && !child.isSubtypeMarker) {
+            if (!child.isParameter() && !child.isSubtypeMarker) {
                 body.add(child);
             }
         }
@@ -1000,47 +1239,55 @@ public final class SpecSketchGenerator {
         return properties;
     }
 
-    private static void validateHeaderPlacement(List<Node> roots, Node request, Node response) {
+    /**
+     * Parameters describe one operation, so they only sit directly below its parts: any location
+     * below 'request', and headers below 'response' as well - a response has no other parameters.
+     */
+    private static void validateParameterPlacement(List<Node> roots, Node request, Node response) {
         for (Node root : roots) {
-            if (root.isHeader) {
-                rejectHeader(root);
+            if (root.isParameter()) {
+                rejectParameter(root);
             }
-            boolean headersAllowed = root == request || root == response;
             for (Node child : root.children) {
-                if (child.isHeader && !headersAllowed) {
-                    rejectHeader(child);
+                if (child.isParameter() && root != request && !(root == response && child.isHeader())) {
+                    rejectParameter(child);
                 }
-                rejectNestedHeaders(child);
+                rejectNestedParameters(child);
             }
         }
     }
 
-    private static void rejectNestedHeaders(Node node) {
+    private static void rejectNestedParameters(Node node) {
         for (Node child : node.children) {
-            if (child.isHeader) {
-                rejectHeader(child);
+            if (child.isParameter()) {
+                rejectParameter(child);
             }
-            rejectNestedHeaders(child);
+            rejectNestedParameters(child);
         }
     }
 
-    private static void rejectHeader(Node node) {
-        throw new SpecException("line " + node.lineNo + ": header '@" + node.name
-                + "' is only allowed directly below 'request' or 'response'");
+    private static void rejectParameter(Node node) {
+        if (node.isHeader()) {
+            throw new SpecException("line " + node.lineNo + ": header '@" + node.name
+                    + "' is only allowed directly below 'request' or 'response'");
+        }
+        throw new SpecException("line " + node.lineNo + ": parameter '" + node.sigilName()
+                + "' is only allowed directly below 'request'");
     }
 
     private static void defineTypes(Node node, Registry registry, boolean isRequestRoot) {
         List<Node> subtypes = subtypeMarkers(node);
         Map<String, Node> properties = node.children.isEmpty() ? Map.of() : declaredProperties(node);
-        // '@' headers are not part of the schema, so a line carrying only headers (or nothing at
-        // all) defines nothing - it is a plain reference and may point at a type defined elsewhere
+        // parameters (headers included) are not part of the schema, so a line carrying only those
+        // (or nothing at all) defines nothing - it is a plain reference and may point at a type
+        // defined elsewhere
         if (properties.isEmpty() && subtypes.isEmpty()) {
-            boolean headerOnlyRequest = isRequestRoot && !node.children.isEmpty();
-            if (!headerOnlyRequest) {
+            boolean parameterOnlyRequest = isRequestRoot && !node.children.isEmpty();
+            if (!parameterOnlyRequest) {
                 registerLeaf(node, registry); // such a request has no body, so its type is unused
             }
             for (Node child : node.children) {
-                defineTypes(child, registry, false); // the header types still need defining
+                defineTypes(child, registry, false); // the parameter types still need defining
             }
             return;
         }
@@ -1178,8 +1425,9 @@ public final class SpecSketchGenerator {
                     || !child.children.isEmpty()) {
                 continue;
             }
-            if (child.isHeader) {
-                throw new SpecException("line " + child.lineNo + ": a header cannot be a discriminator");
+            if (child.isParameter()) {
+                throw new SpecException("line " + child.lineNo + ": a "
+                        + (child.isHeader() ? "header" : "parameter") + " cannot be a discriminator");
             }
             if (discriminator != null) {
                 throw new SpecException("line " + child.lineNo + ": type '" + node.type

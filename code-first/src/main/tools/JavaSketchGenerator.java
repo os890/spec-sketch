@@ -44,6 +44,7 @@ import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Properties;
 import java.util.Set;
 import java.util.TreeSet;
@@ -112,6 +113,16 @@ import java.util.jar.JarFile;
  *            [--subtypes <base>=<class>[,<class>]] ...
  *        Sketch and yaml are written side by side into the output directory, one pair per
  *        endpoint, named after the endpoint method.
+ *        The command line is only the outermost layer: it is parsed into a {@link Configuration}
+ *        (all values resolved) which {@link #generate(Configuration, List)} then runs. A caller
+ *        that already has those values - a build plugin, another generator, a test - builds the
+ *        Configuration itself and calls generate, instead of assembling a String[]:
+ *            var messages = new ArrayList<String>();
+ *            var written = JavaSketchGenerator.generate(
+ *                    new JavaSketchGenerator.Configuration(PetResource.class, Path.of("out")),
+ *                    messages);
+ *        Only main() reads arguments, prints and sets exit codes; generate() reports through
+ *        'messages', returns what it wrote, and throws when something cannot be expressed.
  */
 public final class JavaSketchGenerator {
 
@@ -230,33 +241,104 @@ public final class JavaSketchGenerator {
 
     // ------------------------------------------------------------------- main
 
-    public static void main(String[] args) throws IOException {
+    private static final String USAGE = "usage: java -cp <classpath> JavaSketchGenerator"
+            + " <resource-class> <output-dir> [--response <method>=<class>[]] ..."
+            + " [--responses <file>] [--subtypes <base>=<class>[,<class>]] ...";
+
+    /**
+     * Everything one run needs, with every value already resolved. The command line is one way to
+     * arrive at it ({@link #parseArguments}), not the only one: a caller that has the values at
+     * hand - a build plugin, another generator, a test - builds it directly and calls
+     * {@link #generate}, without formatting its arguments into a String[] first.
+     *
+     * @param resource      the JAX-RS resource class whose endpoint methods are generated
+     * @param outputDir     where the .sketch/.yaml pairs are written, one pair per endpoint
+     * @param responseTypes method name -> payload class name (a '[]' suffix means a list), for the
+     *                      endpoints whose return type hides the payload; the '--response' option
+     * @param subtypes      base type name (qualified or simple) -> its subtypes, for hierarchies
+     *                      that declare them nowhere; the '--subtypes' option
+     */
+    public record Configuration(Class<?> resource, Path outputDir, Map<String, String> responseTypes,
+                                Map<String, List<Class<?>>> subtypes) {
+
+        public Configuration {
+            Objects.requireNonNull(resource, "resource");
+            Objects.requireNonNull(outputDir, "outputDir");
+            responseTypes = Map.copyOf(responseTypes);
+            subtypes = Map.copyOf(subtypes);
+        }
+
+        /** The common case: a resource whose endpoints and hierarchies state everything themselves. */
+        public Configuration(Class<?> resource, Path outputDir) {
+            this(resource, outputDir, Map.of(), Map.of());
+        }
+    }
+
+    /** What one endpoint produced, so a caller can report on it or pick the files up from here. */
+    public record GeneratedEndpoint(String methodName, String httpMethod, String path,
+                                    Path sketchFile, Path yamlFile) {
+    }
+
+    /**
+     * Runs the generator: one .sketch + .yaml pair per endpoint of the resource class. Neither
+     * reads the command line nor prints anything, so it is the entry point to reuse - what the run
+     * decided on the model's behalf lands in {@code messages} (the convention of
+     * {@link #toSketch} and SpecSketchGenerator.translate), what it wrote is returned, and
+     * anything that cannot be expressed correctly throws instead of being emitted.
+     */
+    public static List<GeneratedEndpoint> generate(Configuration configuration, List<String> messages)
+            throws IOException {
+        // reading the resource first: a class without endpoints must not leave a directory behind
+        List<Endpoint> endpoints =
+                readEndpoints(configuration.resource(), configuration.responseTypes(), messages);
+        Files.createDirectories(configuration.outputDir());
+        List<GeneratedEndpoint> generated = new ArrayList<>();
+        for (Endpoint endpoint : endpoints) {
+            List<String> sketch = toSketch(endpoint, configuration.subtypes(), messages);
+            Path sketchFile = configuration.outputDir().resolve(endpoint.methodName() + ".sketch");
+            writeSketch(sketchFile, sketch, messages);
+            Path yamlFile = configuration.outputDir().resolve(endpoint.methodName() + ".yaml");
+            SpecSketchGenerator.translate(sketchFile, yamlFile, messages);
+            generated.add(new GeneratedEndpoint(endpoint.methodName(), endpoint.httpMethod(),
+                    endpoint.path(), sketchFile, yamlFile));
+        }
+        return generated;
+    }
+
+    /** The command line as a {@link Configuration}: the only place that reads args by index. */
+    static Configuration parseArguments(String[] args) throws IOException {
         if (args.length < 2) {
-            System.err.println("usage: java -cp <classpath> JavaSketchGenerator <resource-class>"
-                    + " <output-dir> [--response <method>=<class>[]] ... [--responses <file>]"
-                    + " [--subtypes <base>=<class>[,<class>]] ...");
+            throw new GeneratorException("expected at least a resource class and an output"
+                    + " directory, got " + args.length + " argument(s)");
+        }
+        Class<?> resource = resourceClass(args[0]);
+        Map<String, List<Class<?>>> subtypes =
+                resolveSubtypes(parseOptions(args, "--subtypes", null), resource.getClassLoader());
+        return new Configuration(resource, Path.of(args[1]),
+                parseOptions(args, "--response", "--responses"), subtypes);
+    }
+
+    private static Class<?> resourceClass(String className) {
+        try {
+            return Class.forName(className);
+        } catch (ClassNotFoundException e) {
+            throw new GeneratorException("class not found: " + e.getMessage());
+        }
+    }
+
+    public static void main(String[] args) throws IOException {
+        // the usage text and the exit codes are the command line's contract, not the generator's
+        if (args.length < 2) {
+            System.err.println(USAGE);
             System.exit(2);
         }
         List<String> messages = new ArrayList<>();
         try {
-            Class<?> resource = Class.forName(args[0]);
-            Path outputDir = Path.of(args[1]);
-            Map<String, String> responseTypes = parseOptions(args, "--response", "--responses");
-            Map<String, List<Class<?>>> declaredSubtypes =
-                    resolveSubtypes(parseOptions(args, "--subtypes", null), resource.getClassLoader());
-            for (Endpoint endpoint : readEndpoints(resource, responseTypes, messages)) {
-                List<String> sketch = toSketch(endpoint, declaredSubtypes, messages);
-                Path sketchFile = outputDir.resolve(endpoint.methodName() + ".sketch");
-                Files.createDirectories(outputDir);
-                writeSketch(sketchFile, sketch, messages);
-                Path yamlFile = outputDir.resolve(endpoint.methodName() + ".yaml");
-                SpecSketchGenerator.translate(sketchFile, yamlFile, messages);
-                System.out.println("JavaSketchGenerator: " + endpoint.httpMethod().toUpperCase()
-                        + " " + endpoint.path() + " -> " + sketchFile + " + " + yamlFile);
+            for (GeneratedEndpoint generated : generate(parseArguments(args), messages)) {
+                System.out.println("JavaSketchGenerator: " + generated.httpMethod().toUpperCase()
+                        + " " + generated.path() + " -> " + generated.sketchFile()
+                        + " + " + generated.yamlFile());
             }
-        } catch (ClassNotFoundException e) {
-            System.err.println("JavaSketchGenerator: class not found: " + e.getMessage());
-            System.exit(1);
         } catch (GeneratorException | SpecSketchGenerator.SpecException e) {
             System.err.println("JavaSketchGenerator: " + e.getMessage());
             System.exit(1);
